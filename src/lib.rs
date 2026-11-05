@@ -15,6 +15,7 @@ pub mod event;
 pub mod list;
 pub mod policy;
 pub mod stats;
+pub mod sync;
 
 pub use builder::CacheBuilder;
 pub use cache::{
@@ -23,5 +24,6 @@ pub use cache::{
 pub use clock::{Clock, ManualClock, SystemClock};
 pub use error::{ConfigError, LoadError, ParsePolicyError};
 pub use event::{Listener, RemovalCause};
-pub use policy::{Policy, PolicyKind};
+pub use policy::{BoxedPolicy, Policy, PolicyKind};
 pub use stats::Stats;
+pub use sync::{ShardedCache, SyncCache};

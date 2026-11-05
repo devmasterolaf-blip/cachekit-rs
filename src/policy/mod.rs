@@ -100,6 +100,10 @@ impl<P: Policy + ?Sized> Policy for Box<P> {
     }
 }
 
+/// A policy behind a pointer, used when the policy type is only known at
+/// run time.
+pub type BoxedPolicy = Box<dyn Policy + Send>;
+
 /// The eviction policies that ship with the crate, for choosing one at run
 /// time (from configuration or a command line flag).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -126,7 +130,7 @@ impl PolicyKind {
     }
 
     /// Creates a fresh, empty policy of this kind.
-    pub fn build(self) -> Box<dyn Policy + Send> {
+    pub fn build(self) -> BoxedPolicy {
         match self {
             PolicyKind::Lru => Box::new(Lru::new()),
             PolicyKind::Lfu => Box::new(Lfu::new()),

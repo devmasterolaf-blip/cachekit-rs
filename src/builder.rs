@@ -9,6 +9,7 @@ use crate::clock::Clock;
 use crate::error::ConfigError;
 use crate::event::{Listener, RemovalCause};
 use crate::policy::{Policy, PolicyKind};
+use crate::sync::{ShardedCache, SyncCache};
 
 /// Collects cache settings and checks them before building a cache.
 ///
@@ -149,6 +150,47 @@ where
         Ok(PolicyCache::from_settings(policy, self.into_settings()))
     }
 
+    /// Builds a cache with the selected policy behind a mutex, ready to be
+    /// shared between threads.
+    pub fn build_sync(self) -> Result<SyncCache<K, V>, ConfigError> {
+        self.build().map(SyncCache::new)
+    }
+
+    /// Builds a cache split into `shards` independently locked parts.
+    ///
+    /// The configured `max_entries` and `max_weight` are totals: each shard
+    /// receives an equal share, with any remainder going to the first
+    /// shards. Every shard gets its own instance of the selected policy and
+    /// shares the clock, weigher and listeners.
+    pub fn build_sharded(self, shards: usize) -> Result<ShardedCache<K, V>, ConfigError> {
+        self.validate()?;
+        if shards == 0 {
+            return Err(ConfigError::ZeroShards);
+        }
+        let smallest_bound = [self.max_entries.map(|max| max as u64), self.max_weight]
+            .into_iter()
+            .flatten()
+            .min();
+        if let Some(capacity) = smallest_bound {
+            if shards as u64 > capacity {
+                return Err(ConfigError::TooManyShards { shards, capacity });
+            }
+        }
+        let kind = self.policy;
+        let settings = self.into_settings();
+        let caches = (0..shards)
+            .map(|index| {
+                let mut shard = settings.clone();
+                shard.max_entries = settings
+                    .max_entries
+                    .map(|max| share(max as u64, shards, index) as usize);
+                shard.max_weight = settings.max_weight.map(|max| share(max, shards, index));
+                PolicyCache::from_settings(kind.build(), shard)
+            })
+            .collect();
+        ShardedCache::from_shards(caches)
+    }
+
     fn into_settings(self) -> Settings<K, V> {
         let mut settings = Settings::new();
         settings.max_entries = self.max_entries;
@@ -161,6 +203,13 @@ where
         }
         settings
     }
+}
+
+/// Portion of `total` that part number `index` out of `parts` receives when
+/// the total is split as evenly as possible.
+fn share(total: u64, parts: usize, index: usize) -> u64 {
+    let parts = parts as u64;
+    total / parts + u64::from((index as u64) < total % parts)
 }
 
 #[cfg(test)]
@@ -266,6 +315,76 @@ mod tests {
         cache.put(2, 2);
         cache.put(3, 3);
         assert_eq!(evicted.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn share_distributes_the_remainder_to_the_first_parts() {
+        let shares: Vec<u64> = (0..4).map(|index| share(10, 4, index)).collect();
+        assert_eq!(shares, [3, 3, 2, 2]);
+        assert_eq!((0..3).map(|index| share(9, 3, index)).sum::<u64>(), 9);
+    }
+
+    #[test]
+    fn sharded_build_splits_the_capacity() {
+        let cache = CacheBuilder::<u32, u32>::new()
+            .policy(PolicyKind::Fifo)
+            .max_entries(10)
+            .build_sharded(4)
+            .unwrap();
+        let mut capacities = Vec::new();
+        for key in 0..1000 {
+            let index = cache.shard_index(&key);
+            if capacities.len() <= index {
+                capacities.resize(index + 1, None);
+            }
+            capacities[index] = cache.with_shard(&key, |shard| {
+                assert_eq!(shard.policy_name(), "fifo");
+                shard.max_entries()
+            });
+        }
+        assert_eq!(capacities, [Some(3), Some(3), Some(2), Some(2)]);
+    }
+
+    #[test]
+    fn sharded_build_rejects_bad_shard_counts() {
+        let zero = CacheBuilder::<u32, u32>::new().max_entries(8).build_sharded(0);
+        assert_eq!(zero.err(), Some(ConfigError::ZeroShards));
+
+        let too_many = CacheBuilder::<u32, u32>::new().max_entries(3).build_sharded(4);
+        assert_eq!(
+            too_many.err(),
+            Some(ConfigError::TooManyShards {
+                shards: 4,
+                capacity: 3
+            })
+        );
+
+        let by_weight = CacheBuilder::<u32, u32>::new()
+            .max_entries(100)
+            .max_weight(2)
+            .weigher(|_, _| 1)
+            .build_sharded(3);
+        assert_eq!(
+            by_weight.err(),
+            Some(ConfigError::TooManyShards {
+                shards: 3,
+                capacity: 2
+            })
+        );
+
+        let invalid = CacheBuilder::<u32, u32>::new().build_sharded(2);
+        assert_eq!(invalid.err(), Some(ConfigError::Unbounded));
+    }
+
+    #[test]
+    fn sync_build_wraps_the_selected_policy() {
+        let cache = CacheBuilder::<u32, u32>::new()
+            .policy(PolicyKind::Lfu)
+            .max_entries(2)
+            .build_sync()
+            .unwrap();
+        cache.put(1, 1);
+        assert_eq!(cache.with(|inner| inner.policy_name()), "lfu");
     }
 
     #[test]

@@ -9,7 +9,7 @@ use std::time::Duration;
 use crate::clock::{Clock, SystemClock};
 use crate::error::LoadError;
 use crate::event::{Listener, RemovalCause};
-use crate::policy::{eviction_order, Fifo, Lfu, Lru, Policy};
+use crate::policy::{eviction_order, BoxedPolicy, Fifo, Lfu, Lru, Policy};
 use crate::stats::Stats;
 
 /// Operations shared by every cache in this crate.
@@ -137,6 +137,19 @@ impl<K, V> Settings<K, V> {
     }
 }
 
+impl<K, V> Clone for Settings<K, V> {
+    fn clone(&self) -> Self {
+        Settings {
+            max_entries: self.max_entries,
+            max_weight: self.max_weight,
+            weigher: self.weigher.clone(),
+            ttl: self.ttl,
+            clock: Arc::clone(&self.clock),
+            listeners: self.listeners.clone(),
+        }
+    }
+}
+
 /// A read-only view of one live entry, produced by
 /// [`PolicyCache::entries`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -193,7 +206,7 @@ pub type LruCache<K, V> = PolicyCache<K, V, Lru>;
 
 /// A cache whose built-in policy was chosen at run time, as produced by
 /// [`CacheBuilder::build`](crate::CacheBuilder::build).
-pub type DynCache<K, V> = PolicyCache<K, V, Box<dyn Policy + Send>>;
+pub type DynCache<K, V> = PolicyCache<K, V, BoxedPolicy>;
 
 /// A cache that evicts the least frequently used entry.
 pub type LfuCache<K, V> = PolicyCache<K, V, Lfu>;

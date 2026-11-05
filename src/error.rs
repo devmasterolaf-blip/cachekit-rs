@@ -19,6 +19,16 @@ pub enum ConfigError {
     UnusedWeigher,
     /// The time to live was zero, which would expire entries immediately.
     ZeroTtl,
+    /// A sharded cache was requested with zero shards.
+    ZeroShards,
+    /// There are more shards than capacity to share between them, which
+    /// would leave some shards unable to hold anything.
+    TooManyShards {
+        /// Number of shards requested.
+        shards: usize,
+        /// The capacity bound (entries or weight) that is too small.
+        capacity: u64,
+    },
 }
 
 impl fmt::Display for ConfigError {
@@ -44,6 +54,16 @@ impl fmt::Display for ConfigError {
             }
             ConfigError::ZeroTtl => {
                 write!(f, "the time to live must be longer than zero")
+            }
+            ConfigError::ZeroShards => {
+                write!(f, "a sharded cache needs at least one shard")
+            }
+            ConfigError::TooManyShards { shards, capacity } => {
+                write!(
+                    f,
+                    "{shards} shards cannot share a capacity of {capacity}; \
+                     use fewer shards or a larger capacity"
+                )
             }
         }
     }
@@ -140,6 +160,14 @@ mod tests {
     fn config_errors_have_actionable_messages() {
         assert!(ConfigError::Unbounded.to_string().contains("max_entries"));
         assert!(ConfigError::ZeroCapacity.to_string().contains("at least 1"));
+        let shards = ConfigError::TooManyShards {
+            shards: 8,
+            capacity: 4,
+        };
+        assert_eq!(
+            shards.to_string(),
+            "8 shards cannot share a capacity of 4; use fewer shards or a larger capacity"
+        );
     }
 
     #[test]
