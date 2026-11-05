@@ -1,0 +1,14 @@
+# A short browsing session. Run it with, for example:
+#   cargo run -- replay examples/traces/session.trace --capacity 2 --ttl-ms 1000
+#   cargo run -- compare examples/traces/session.trace --capacity 2
+put home /index.html
+put about /about.html
+get home
+tick 500
+put blog /blog.html
+get about
+get home
+tick 600
+get blog
+get home
+purge
