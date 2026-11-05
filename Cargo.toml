@@ -1,0 +1,20 @@
+[package]
+name = "cachekit"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.74"
+description = "In-memory caching toolkit: LRU, LFU and FIFO eviction, TTL, weighted capacity, statistics and a trace replay CLI"
+license = "MIT"
+readme = "README.md"
+keywords = ["cache", "lru", "lfu", "ttl"]
+categories = ["caching", "data-structures"]
+
+[lib]
+name = "cachekit"
+path = "src/lib.rs"
+
+[[bin]]
+name = "cachekit"
+path = "src/main.rs"
+
+[dependencies]
