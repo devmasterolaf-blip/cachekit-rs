@@ -7,7 +7,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::clock::{Clock, SystemClock};
-use crate::policy::{Fifo, Lfu, Lru, Policy};
+use crate::event::{Listener, RemovalCause};
+use crate::policy::{eviction_order, Fifo, Lfu, Lru, Policy};
 use crate::stats::Stats;
 
 /// Operations shared by every cache in this crate.
@@ -50,7 +51,8 @@ pub trait Cache<K, V> {
         self.len() == 0
     }
 
-    /// Removes every entry. Statistics are kept.
+    /// Removes every entry. Statistics are kept, and each dropped entry is
+    /// counted as an explicit removal.
     fn clear(&mut self);
 
     /// A copy of the activity counters.
@@ -105,6 +107,7 @@ pub struct PolicyCache<K, V, P> {
     total_weight: u64,
     default_ttl: Option<Duration>,
     clock: Arc<dyn Clock>,
+    listeners: Vec<Listener<K, V>>,
     stats: Stats,
 }
 
@@ -116,6 +119,7 @@ pub(crate) struct Settings<K, V> {
     pub(crate) weigher: Option<Weigher<K, V>>,
     pub(crate) ttl: Option<Duration>,
     pub(crate) clock: Arc<dyn Clock>,
+    pub(crate) listeners: Vec<Listener<K, V>>,
 }
 
 impl<K, V> Settings<K, V> {
@@ -127,6 +131,7 @@ impl<K, V> Settings<K, V> {
             weigher: None,
             ttl: None,
             clock: Arc::new(SystemClock::new()),
+            listeners: Vec::new(),
         }
     }
 }
@@ -188,6 +193,7 @@ where
             total_weight: 0,
             default_ttl: settings.ttl,
             clock: settings.clock,
+            listeners: settings.listeners,
             stats: Stats::new(),
         }
     }
@@ -215,6 +221,16 @@ where
             return None;
         }
         Some(self.entry(slot).weight)
+    }
+
+    /// Registers a callback that is told about every entry leaving the
+    /// cache, together with the [`RemovalCause`]. Listeners are called in
+    /// the order they were added.
+    pub fn add_listener<F>(&mut self, listener: F)
+    where
+        F: Fn(&K, &V, RemovalCause) + Send + Sync + 'static,
+    {
+        self.listeners.push(Arc::new(listener));
     }
 
     /// Name of the eviction policy, for example `"lru"`.
@@ -296,6 +312,7 @@ where
             }
             let entry = self.detach(slot);
             self.stats.removals += 1;
+            self.notify(&entry.key, &entry.value, RemovalCause::Explicit);
             return Some((entry.key, entry.value));
         }
     }
@@ -312,10 +329,17 @@ where
             .is_some_and(|at| self.clock.now() >= at)
     }
 
+    fn notify(&self, key: &K, value: &V, cause: RemovalCause) {
+        for listener in &self.listeners {
+            listener(key, value, cause);
+        }
+    }
+
     /// Removes the expired entry in `slot`.
     fn expire(&mut self, slot: usize) {
-        self.detach(slot);
+        let entry = self.detach(slot);
         self.stats.expirations += 1;
+        self.notify(&entry.key, &entry.value, RemovalCause::Expired);
     }
 
     /// Slot holding a live entry for `key`. An expired entry found under the
@@ -355,8 +379,11 @@ where
             // The value can never fit, even in an empty cache. Whatever was
             // stored under the key is stale now, so it goes as well.
             self.stats.rejections += 1;
+            self.notify(&key, &value, RemovalCause::Rejected);
             let slot = self.live_slot(&key)?;
-            return Some(self.detach(slot).value);
+            let stale = self.detach(slot);
+            self.notify(&stale.key, &stale.value, RemovalCause::Replaced);
+            return Some(stale.value);
         }
         let expires_at = self.deadline(ttl);
         if let Some(slot) = self.live_slot(&key) {
@@ -367,6 +394,7 @@ where
             self.total_weight = (self.total_weight - old_weight).saturating_add(weight);
             self.policy.on_update(slot);
             self.stats.updates += 1;
+            self.notify(&key, &old, RemovalCause::Replaced);
             self.evict_others_until_fit(slot);
             return Some(old);
         }
@@ -452,8 +480,9 @@ where
         if self.is_expired(slot) {
             self.expire(slot);
         } else {
-            self.detach(slot);
+            let entry = self.detach(slot);
             self.stats.evictions += 1;
+            self.notify(&entry.key, &entry.value, RemovalCause::Evicted);
         }
     }
 }
@@ -489,6 +518,7 @@ where
         let slot = self.live_slot(key)?;
         let entry = self.detach(slot);
         self.stats.removals += 1;
+        self.notify(&entry.key, &entry.value, RemovalCause::Explicit);
         Some(entry.value)
     }
 
@@ -497,6 +527,13 @@ where
     }
 
     fn clear(&mut self) {
+        if !self.listeners.is_empty() {
+            for slot in eviction_order(&self.policy) {
+                let entry = self.entry(slot);
+                self.notify(&entry.key, &entry.value, RemovalCause::Explicit);
+            }
+        }
+        self.stats.removals += self.map.len() as u64;
         self.map.clear();
         self.slots.clear();
         self.free.clear();
@@ -518,6 +555,8 @@ mod tests {
     use super::*;
     use crate::builder::CacheBuilder;
     use crate::clock::ManualClock;
+    use std::fmt::Debug;
+    use std::sync::Mutex;
 
     const SECOND: Duration = Duration::from_secs(1);
 
@@ -540,6 +579,24 @@ mod tests {
             .weigher(|_key: &&'static str, value: &String| value.len() as u64)
             .build_with(policy)
             .unwrap()
+    }
+
+    type Events = Arc<Mutex<Vec<(String, RemovalCause)>>>;
+
+    /// Records `key=value` and the cause for every removal notification.
+    fn recorder<K: Debug, V: Debug>() -> (Events, impl Fn(&K, &V, RemovalCause) + Send + Sync) {
+        let events = Events::default();
+        let sink = Arc::clone(&events);
+        let listener = move |key: &K, value: &V, cause: RemovalCause| {
+            sink.lock()
+                .unwrap()
+                .push((format!("{key:?}={value:?}"), cause));
+        };
+        (events, listener)
+    }
+
+    fn drain(events: &Events) -> Vec<(String, RemovalCause)> {
+        mem::take(&mut *events.lock().unwrap())
     }
 
     fn text(len: usize) -> String {
@@ -629,6 +686,7 @@ mod tests {
         cache.clear();
         assert!(cache.is_empty());
         assert_eq!(cache.stats().hits, 1);
+        assert_eq!(cache.stats().removals, 1);
         cache.put("b", 2);
         assert_eq!(cache.get(&"b"), Some(&2));
     }
@@ -945,6 +1003,90 @@ mod tests {
         assert_eq!(cache.weight_of(&1), Some(1));
         assert_eq!(cache.weight_of(&9), None);
         assert_eq!(cache.max_weight(), None);
+    }
+
+    #[test]
+    fn listener_sees_eviction_replacement_and_explicit_removal() {
+        let mut cache = LruCache::new(2);
+        let (events, listener) = recorder();
+        cache.add_listener(listener);
+        cache.put("a", 1);
+        cache.put("b", 2);
+        assert!(drain(&events).is_empty(), "plain inserts remove nothing");
+        cache.put("a", 10);
+        cache.put("c", 3);
+        cache.remove(&"a");
+        cache.pop_coldest();
+        assert_eq!(
+            drain(&events),
+            vec![
+                ("\"a\"=1".to_string(), RemovalCause::Replaced),
+                ("\"b\"=2".to_string(), RemovalCause::Evicted),
+                ("\"a\"=10".to_string(), RemovalCause::Explicit),
+                ("\"c\"=3".to_string(), RemovalCause::Explicit),
+            ]
+        );
+    }
+
+    #[test]
+    fn listener_sees_expiry_from_lookup_and_purge() {
+        let (mut cache, clock) = expiring_cache(4);
+        let (events, listener) = recorder();
+        cache.add_listener(listener);
+        cache.put("a", 1);
+        cache.put("b", 2);
+        clock.advance(10 * SECOND);
+        cache.get(&"a");
+        cache.purge_expired();
+        assert_eq!(
+            drain(&events),
+            vec![
+                ("\"a\"=1".to_string(), RemovalCause::Expired),
+                ("\"b\"=2".to_string(), RemovalCause::Expired),
+            ]
+        );
+    }
+
+    #[test]
+    fn listener_sees_rejection_and_the_stale_value() {
+        let mut cache = weighted_cache(Lru::new(), 4);
+        let (events, listener) = recorder();
+        cache.add_listener(listener);
+        cache.put("a", text(1));
+        cache.put("a", text(5));
+        assert_eq!(
+            drain(&events),
+            vec![
+                ("\"a\"=\"xxxxx\"".to_string(), RemovalCause::Rejected),
+                ("\"a\"=\"x\"".to_string(), RemovalCause::Replaced),
+            ]
+        );
+    }
+
+    #[test]
+    fn clear_notifies_in_eviction_order() {
+        let mut cache = LruCache::new(3);
+        let (events, listener) = recorder();
+        cache.add_listener(listener);
+        cache.put("a", 1);
+        cache.put("b", 2);
+        cache.get(&"a");
+        cache.clear();
+        let keys: Vec<String> = drain(&events).into_iter().map(|(entry, _)| entry).collect();
+        assert_eq!(keys, vec!["\"b\"=2", "\"a\"=1"]);
+    }
+
+    #[test]
+    fn several_listeners_run_in_registration_order() {
+        let mut cache = LruCache::new(1);
+        let order = Arc::new(Mutex::new(Vec::new()));
+        for id in 0..3 {
+            let order = Arc::clone(&order);
+            cache.add_listener(move |_: &u8, _: &u8, _| order.lock().unwrap().push(id));
+        }
+        cache.put(1, 1);
+        cache.put(2, 2);
+        assert_eq!(*order.lock().unwrap(), vec![0, 1, 2]);
     }
 
     #[test]

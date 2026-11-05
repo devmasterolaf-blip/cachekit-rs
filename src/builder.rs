@@ -7,6 +7,7 @@ use std::time::Duration;
 use crate::cache::{DynCache, PolicyCache, Settings, Weigher};
 use crate::clock::Clock;
 use crate::error::ConfigError;
+use crate::event::{Listener, RemovalCause};
 use crate::policy::{Policy, PolicyKind};
 
 /// Collects cache settings and checks them before building a cache.
@@ -29,6 +30,7 @@ pub struct CacheBuilder<K, V> {
     weigher: Option<Weigher<K, V>>,
     ttl: Option<Duration>,
     clock: Option<Arc<dyn Clock>>,
+    listeners: Vec<Listener<K, V>>,
 }
 
 impl<K, V> Default for CacheBuilder<K, V> {
@@ -40,6 +42,7 @@ impl<K, V> Default for CacheBuilder<K, V> {
             weigher: None,
             ttl: None,
             clock: None,
+            listeners: Vec::new(),
         }
     }
 }
@@ -99,6 +102,16 @@ where
         self
     }
 
+    /// Adds a callback that is told about every entry leaving the cache.
+    /// May be called several times; listeners run in the order added.
+    pub fn listener<F>(mut self, listener: F) -> Self
+    where
+        F: Fn(&K, &V, RemovalCause) + Send + Sync + 'static,
+    {
+        self.listeners.push(Arc::new(listener));
+        self
+    }
+
     /// Checks the configuration without building anything.
     pub fn validate(&self) -> Result<(), ConfigError> {
         if self.max_entries.is_none() && self.max_weight.is_none() {
@@ -142,6 +155,7 @@ where
         settings.max_weight = self.max_weight;
         settings.weigher = self.weigher;
         settings.ttl = self.ttl;
+        settings.listeners = self.listeners;
         if let Some(clock) = self.clock {
             settings.clock = clock;
         }
@@ -155,6 +169,7 @@ mod tests {
     use crate::cache::Cache;
     use crate::clock::ManualClock;
     use crate::policy::Fifo;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
     fn builds_each_built_in_policy() {
@@ -232,6 +247,25 @@ mod tests {
         cache.put("k", 1);
         clock.advance(Duration::from_secs(10));
         assert_eq!(cache.get(&"k"), None);
+    }
+
+    #[test]
+    fn listeners_from_the_builder_are_installed() {
+        let evicted = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&evicted);
+        let mut cache = CacheBuilder::new()
+            .max_entries(1)
+            .listener(move |_: &u32, _: &u32, cause| {
+                if cause == RemovalCause::Evicted {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                }
+            })
+            .build()
+            .unwrap();
+        cache.put(1, 1);
+        cache.put(2, 2);
+        cache.put(3, 3);
+        assert_eq!(evicted.load(Ordering::SeqCst), 2);
     }
 
     #[test]
