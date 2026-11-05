@@ -8,9 +8,11 @@
 #![warn(missing_docs)]
 
 pub mod cache;
+pub mod clock;
 pub mod list;
 pub mod policy;
 pub mod stats;
 
 pub use cache::{Cache, FifoCache, LfuCache, LruCache, PolicyCache};
+pub use clock::{Clock, ManualClock, SystemClock};
 pub use stats::Stats;
