@@ -137,6 +137,57 @@ impl<K, V> Settings<K, V> {
     }
 }
 
+/// A read-only view of one live entry, produced by
+/// [`PolicyCache::entries`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EntryView<'a, K, V> {
+    /// The entry's key.
+    pub key: &'a K,
+    /// The entry's value.
+    pub value: &'a V,
+    /// Weight recorded when the value was written.
+    pub weight: u64,
+    /// Time left before the entry expires, `None` if it never does.
+    pub remaining_ttl: Option<Duration>,
+}
+
+/// Iterator over the live entries of a cache in eviction order, coldest
+/// first. Created by [`PolicyCache::entries`].
+pub struct Entries<'a, K, V, P> {
+    cache: &'a PolicyCache<K, V, P>,
+    cursor: Option<usize>,
+    now: Duration,
+}
+
+impl<'a, K, V, P> Iterator for Entries<'a, K, V, P>
+where
+    K: Hash + Eq + Clone,
+    P: Policy,
+{
+    type Item = EntryView<'a, K, V>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while let Some(slot) = self.cursor {
+            self.cursor = self.cache.policy.next(slot);
+            let entry = self.cache.entry(slot);
+            let remaining_ttl = match entry.expires_at {
+                None => None,
+                Some(deadline) => match deadline.checked_sub(self.now) {
+                    Some(left) if !left.is_zero() => Some(left),
+                    _ => continue,
+                },
+            };
+            return Some(EntryView {
+                key: &entry.key,
+                value: &entry.value,
+                weight: entry.weight,
+                remaining_ttl,
+            });
+        }
+        None
+    }
+}
+
 /// A cache that evicts the least recently used entry.
 pub type LruCache<K, V> = PolicyCache<K, V, Lru>;
 
@@ -222,6 +273,28 @@ where
             return None;
         }
         Some(self.entry(slot).weight)
+    }
+
+    /// Iterates over the live entries in eviction order, coldest first,
+    /// with their weight and remaining time to live. Expired entries are
+    /// skipped. Iterating does not count as reading the entries.
+    pub fn entries(&self) -> Entries<'_, K, V, P> {
+        Entries {
+            cache: self,
+            cursor: self.policy.coldest(),
+            now: self.clock.now(),
+        }
+    }
+
+    /// Iterates over the live key/value pairs in eviction order, coldest
+    /// first.
+    pub fn iter(&self) -> impl Iterator<Item = (&K, &V)> + '_ {
+        self.entries().map(|entry| (entry.key, entry.value))
+    }
+
+    /// Iterates over the live keys in eviction order, coldest first.
+    pub fn keys(&self) -> impl Iterator<Item = &K> + '_ {
+        self.entries().map(|entry| entry.key)
     }
 
     /// Registers a callback that is told about every entry leaving the
@@ -1184,6 +1257,52 @@ mod tests {
         assert_eq!(value, text(9));
         assert!(cache.is_empty());
         assert_eq!(cache.stats().rejections, 1);
+    }
+
+    #[test]
+    fn iteration_follows_eviction_order() {
+        let mut lru = LruCache::new(3);
+        let mut lfu = LfuCache::new(3);
+        let mut fifo = FifoCache::new(3);
+        for key in ["a", "b", "c"] {
+            lru.put(key, 0);
+            lfu.put(key, 0);
+            fifo.put(key, 0);
+        }
+        for key in ["a", "a", "c"] {
+            lru.get(&key);
+            lfu.get(&key);
+            fifo.get(&key);
+        }
+        assert_eq!(lru.keys().copied().collect::<Vec<_>>(), ["b", "a", "c"]);
+        assert_eq!(lfu.keys().copied().collect::<Vec<_>>(), ["b", "c", "a"]);
+        assert_eq!(fifo.keys().copied().collect::<Vec<_>>(), ["a", "b", "c"]);
+    }
+
+    #[test]
+    fn iteration_skips_expired_entries_and_reports_remaining_ttl() {
+        let (mut cache, clock) = expiring_cache(4);
+        cache.put_with_ttl("short", 1, 2 * SECOND);
+        cache.put("default", 2);
+        clock.advance(3 * SECOND);
+        let entries: Vec<_> = cache.entries().collect();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].key, &"default");
+        assert_eq!(entries[0].remaining_ttl, Some(7 * SECOND));
+        assert_eq!(entries[0].weight, 1);
+        assert_eq!(cache.len(), 2, "iteration does not remove anything");
+    }
+
+    #[test]
+    fn iteration_does_not_touch_stats_or_order() {
+        let mut cache = LruCache::new(2);
+        cache.put("a", 1);
+        cache.put("b", 2);
+        let pairs: Vec<_> = cache.iter().map(|(k, v)| (*k, *v)).collect();
+        assert_eq!(pairs, [("a", 1), ("b", 2)]);
+        assert_eq!(cache.stats().requests(), 0);
+        cache.put("c", 3);
+        assert!(!cache.contains_key(&"a"));
     }
 
     #[test]
