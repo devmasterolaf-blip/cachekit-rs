@@ -7,8 +7,10 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod cache;
 pub mod list;
 pub mod policy;
 pub mod stats;
 
+pub use cache::{Cache, LruCache, PolicyCache};
 pub use stats::Stats;
