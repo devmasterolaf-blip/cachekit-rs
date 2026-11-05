@@ -17,6 +17,7 @@ pub mod policy;
 pub mod snapshot;
 pub mod stats;
 pub mod sync;
+pub mod trace;
 
 pub use builder::CacheBuilder;
 pub use cache::{
