@@ -7,9 +7,11 @@
 //! which lets policies keep their bookkeeping in plain vectors.
 
 mod fifo;
+mod lfu;
 mod lru;
 
 pub use fifo::Fifo;
+pub use lfu::Lfu;
 pub use lru::Lru;
 
 /// Bookkeeping needed to choose eviction victims.

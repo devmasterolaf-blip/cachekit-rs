@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::hash::Hash;
 use std::mem;
 
-use crate::policy::{Fifo, Lru, Policy};
+use crate::policy::{Fifo, Lfu, Lru, Policy};
 use crate::stats::Stats;
 
 /// Operations shared by every cache in this crate.
@@ -85,6 +85,9 @@ pub struct PolicyCache<K, V, P> {
 
 /// A cache that evicts the least recently used entry.
 pub type LruCache<K, V> = PolicyCache<K, V, Lru>;
+
+/// A cache that evicts the least frequently used entry.
+pub type LfuCache<K, V> = PolicyCache<K, V, Lfu>;
 
 /// A cache that evicts entries in insertion order.
 pub type FifoCache<K, V> = PolicyCache<K, V, Fifo>;
@@ -387,6 +390,22 @@ mod tests {
         assert!(!cache.contains_key(&"a"), "oldest key goes first");
         assert!(cache.contains_key(&"b"));
         assert_eq!(cache.policy_name(), "fifo");
+    }
+
+    #[test]
+    fn lfu_keeps_frequently_read_entries() {
+        let mut cache = LfuCache::new(2);
+        cache.put("a", 1);
+        cache.put("b", 2);
+        cache.get(&"a");
+        cache.get(&"a");
+        cache.get(&"b");
+        cache.put("c", 3);
+        assert!(!cache.contains_key(&"b"), "b has fewer uses than a");
+        cache.put("d", 4);
+        assert!(!cache.contains_key(&"c"), "the newcomer has the fewest uses");
+        assert!(cache.contains_key(&"a"));
+        assert!(cache.contains_key(&"d"));
     }
 
     #[test]
