@@ -4,7 +4,16 @@ use std::process::ExitCode;
 use cachekit::cli::{self, CliError};
 
 fn main() -> ExitCode {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut args = Vec::new();
+    for arg in std::env::args_os().skip(1) {
+        match arg.into_string() {
+            Ok(arg) => args.push(arg),
+            Err(raw) => {
+                eprintln!("cachekit: argument {raw:?} is not valid UTF-8");
+                return ExitCode::from(2);
+            }
+        }
+    }
     let stdin = io::stdin();
     let mut out = io::BufWriter::new(io::stdout().lock());
 
