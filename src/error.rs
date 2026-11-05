@@ -11,6 +11,8 @@ pub enum ConfigError {
     Unbounded,
     /// `max_entries` was set to zero.
     ZeroCapacity,
+    /// The time to live was zero, which would expire entries immediately.
+    ZeroTtl,
 }
 
 impl fmt::Display for ConfigError {
@@ -21,6 +23,9 @@ impl fmt::Display for ConfigError {
             }
             ConfigError::ZeroCapacity => {
                 write!(f, "max_entries must be at least 1")
+            }
+            ConfigError::ZeroTtl => {
+                write!(f, "the time to live must be longer than zero")
             }
         }
     }

@@ -3,7 +3,10 @@
 use std::collections::HashMap;
 use std::hash::Hash;
 use std::mem;
+use std::sync::Arc;
+use std::time::Duration;
 
+use crate::clock::{Clock, SystemClock};
 use crate::policy::{Fifo, Lfu, Lru, Policy};
 use crate::stats::Stats;
 
@@ -13,10 +16,12 @@ use crate::stats::Stats;
 /// concrete cache type is chosen at run time.
 pub trait Cache<K, V> {
     /// Looks up `key`, counting a hit or a miss and telling the eviction
-    /// policy about the read.
+    /// policy about the read. An entry whose time to live has passed is
+    /// removed and reported as a miss.
     fn get(&mut self, key: &K) -> Option<&V>;
 
-    /// Looks up `key` without touching statistics or eviction order.
+    /// Looks up `key` without touching statistics or eviction order. Expired
+    /// entries are not returned, but they are not removed either.
     fn peek(&self, key: &K) -> Option<&V>;
 
     /// Stores `value` under `key` and returns the value it replaced, if any.
@@ -32,7 +37,9 @@ pub trait Cache<K, V> {
         self.peek(key).is_some()
     }
 
-    /// Number of entries currently stored.
+    /// Number of entries currently stored. Expired entries that have not
+    /// been removed yet are included; they disappear when they are next
+    /// looked up or when the cache is purged.
     fn len(&self) -> usize;
 
     /// Returns `true` when the cache holds no entries.
@@ -55,6 +62,8 @@ pub trait Cache<K, V> {
 struct Entry<K, V> {
     key: K,
     value: V,
+    /// Clock reading at which the entry stops being valid.
+    expires_at: Option<Duration>,
 }
 
 /// A bounded cache whose eviction order is decided by the policy `P`.
@@ -80,6 +89,8 @@ pub struct PolicyCache<K, V, P> {
     free: Vec<usize>,
     policy: P,
     max_entries: Option<usize>,
+    default_ttl: Option<Duration>,
+    clock: Arc<dyn Clock>,
     stats: Stats,
 }
 
@@ -87,6 +98,19 @@ pub struct PolicyCache<K, V, P> {
 /// them; the engine trusts what it is given.
 pub(crate) struct Settings {
     pub(crate) max_entries: Option<usize>,
+    pub(crate) ttl: Option<Duration>,
+    pub(crate) clock: Arc<dyn Clock>,
+}
+
+impl Settings {
+    /// Settings with no bounds, no expiry and the system clock.
+    pub(crate) fn new() -> Self {
+        Settings {
+            max_entries: None,
+            ttl: None,
+            clock: Arc::new(SystemClock::new()),
+        }
+    }
 }
 
 /// A cache that evicts the least recently used entry.
@@ -121,19 +145,17 @@ where
     }
 
     /// Creates a cache holding at most `max_entries` entries, evicting with
-    /// the given policy instance.
+    /// the given policy instance. Entries never expire; use
+    /// [`CacheBuilder`](crate::CacheBuilder) for expiry and other options.
     ///
     /// # Panics
     ///
     /// Panics if `max_entries` is zero.
     pub fn with_policy(policy: P, max_entries: usize) -> Self {
         assert!(max_entries > 0, "a cache needs room for at least one entry");
-        Self::from_settings(
-            policy,
-            Settings {
-                max_entries: Some(max_entries),
-            },
-        )
+        let mut settings = Settings::new();
+        settings.max_entries = Some(max_entries);
+        Self::from_settings(policy, settings)
     }
 
     pub(crate) fn from_settings(policy: P, settings: Settings) -> Self {
@@ -143,6 +165,8 @@ where
             free: Vec::new(),
             policy,
             max_entries: settings.max_entries,
+            default_ttl: settings.ttl,
+            clock: settings.clock,
             stats: Stats::new(),
         }
     }
@@ -157,20 +181,136 @@ where
         self.policy.name()
     }
 
-    /// The entry the policy would evict next.
-    pub fn peek_coldest(&self) -> Option<(&K, &V)> {
-        let slot = self.policy.coldest()?;
-        let entry = self.entry(slot);
-        Some((&entry.key, &entry.value))
+    /// Time to live applied by [`put`](Cache::put), if any.
+    pub fn default_ttl(&self) -> Option<Duration> {
+        self.default_ttl
     }
 
-    /// Removes and returns the entry the policy would evict next. The removal
-    /// is counted as an explicit removal, not as an eviction.
+    /// Stores `value` under `key` with its own time to live, overriding the
+    /// cache default for this entry. Returns the live value it replaced.
+    ///
+    /// A zero `ttl` means the value is never valid: nothing is stored and the
+    /// call behaves like [`remove`](Cache::remove).
+    pub fn put_with_ttl(&mut self, key: K, value: V, ttl: Duration) -> Option<V> {
+        if ttl.is_zero() {
+            return self.remove(&key);
+        }
+        self.store(key, value, Some(ttl))
+    }
+
+    /// Time left before `key` expires. `None` if the key is absent, already
+    /// expired, or has no expiry.
+    pub fn remaining_ttl(&self, key: &K) -> Option<Duration> {
+        let slot = *self.map.get(key)?;
+        let deadline = self.entry(slot).expires_at?;
+        deadline
+            .checked_sub(self.clock.now())
+            .filter(|left| !left.is_zero())
+    }
+
+    /// Removes every expired entry and returns how many were removed.
+    ///
+    /// Expired entries are otherwise only removed when they are looked up, so
+    /// a cache that is written more than it is read should call this from
+    /// time to time. The call scans all entries.
+    pub fn purge_expired(&mut self) -> usize {
+        let now = self.clock.now();
+        let expired: Vec<usize> = self
+            .slots
+            .iter()
+            .enumerate()
+            .filter_map(|(slot, entry)| match entry {
+                Some(entry) if entry.expires_at.is_some_and(|at| now >= at) => Some(slot),
+                _ => None,
+            })
+            .collect();
+        for &slot in &expired {
+            self.expire(slot);
+        }
+        expired.len()
+    }
+
+    /// The live entry the policy would evict next.
+    pub fn peek_coldest(&self) -> Option<(&K, &V)> {
+        let mut cursor = self.policy.coldest();
+        while let Some(slot) = cursor {
+            if !self.is_expired(slot) {
+                let entry = self.entry(slot);
+                return Some((&entry.key, &entry.value));
+            }
+            cursor = self.policy.next(slot);
+        }
+        None
+    }
+
+    /// Removes and returns the live entry the policy would evict next. The
+    /// removal is counted as an explicit removal, not as an eviction. Expired
+    /// entries met on the way are dropped.
     pub fn pop_coldest(&mut self) -> Option<(K, V)> {
-        let slot = self.policy.coldest()?;
-        let entry = self.detach(slot);
-        self.stats.removals += 1;
-        Some((entry.key, entry.value))
+        loop {
+            let slot = self.policy.coldest()?;
+            if self.is_expired(slot) {
+                self.expire(slot);
+                continue;
+            }
+            let entry = self.detach(slot);
+            self.stats.removals += 1;
+            return Some((entry.key, entry.value));
+        }
+    }
+
+    /// Clock reading at which a value written now with `ttl` expires. A
+    /// deadline too far away to represent means the entry never expires.
+    fn deadline(&self, ttl: Option<Duration>) -> Option<Duration> {
+        ttl.and_then(|ttl| self.clock.now().checked_add(ttl))
+    }
+
+    fn is_expired(&self, slot: usize) -> bool {
+        self.entry(slot)
+            .expires_at
+            .is_some_and(|at| self.clock.now() >= at)
+    }
+
+    /// Removes the expired entry in `slot`.
+    fn expire(&mut self, slot: usize) {
+        self.detach(slot);
+        self.stats.expirations += 1;
+    }
+
+    /// Slot holding a live entry for `key`. An expired entry found under the
+    /// key is removed on the spot.
+    fn live_slot(&mut self, key: &K) -> Option<usize> {
+        let slot = *self.map.get(key)?;
+        if self.is_expired(slot) {
+            self.expire(slot);
+            None
+        } else {
+            Some(slot)
+        }
+    }
+
+    fn store(&mut self, key: K, value: V, ttl: Option<Duration>) -> Option<V> {
+        let expires_at = self.deadline(ttl);
+        if let Some(slot) = self.live_slot(&key) {
+            let entry = self.entry_mut(slot);
+            entry.expires_at = expires_at;
+            let old = mem::replace(&mut entry.value, value);
+            self.policy.on_update(slot);
+            self.stats.updates += 1;
+            return Some(old);
+        }
+        while self.max_entries.is_some_and(|max| self.map.len() >= max) {
+            if !self.evict_coldest() {
+                break;
+            }
+        }
+        self.attach(Entry {
+            key,
+            value,
+            expires_at,
+        });
+        self.stats.insertions += 1;
+        None
     }
 
     fn entry(&self, slot: usize) -> &Entry<K, V> {
@@ -214,10 +354,15 @@ where
         entry
     }
 
-    /// Evicts the coldest entry. Returns `false` if there was nothing left to
-    /// evict.
+    /// Makes room by removing the coldest entry. If that entry has already
+    /// expired the removal is counted as an expiration rather than an
+    /// eviction. Returns `false` if there was nothing left to remove.
     fn evict_coldest(&mut self) -> bool {
         match self.policy.coldest() {
+            Some(slot) if self.is_expired(slot) => {
+                self.expire(slot);
+                true
+            }
             Some(slot) => {
                 self.detach(slot);
                 self.stats.evictions += 1;
@@ -234,12 +379,9 @@ where
     P: Policy,
 {
     fn get(&mut self, key: &K) -> Option<&V> {
-        let slot = match self.map.get(key) {
-            Some(&slot) => slot,
-            None => {
-                self.stats.misses += 1;
-                return None;
-            }
+        let Some(slot) = self.live_slot(key) else {
+            self.stats.misses += 1;
+            return None;
         };
         self.stats.hits += 1;
         self.policy.on_access(slot);
@@ -248,28 +390,18 @@ where
 
     fn peek(&self, key: &K) -> Option<&V> {
         let slot = *self.map.get(key)?;
+        if self.is_expired(slot) {
+            return None;
+        }
         Some(&self.entry(slot).value)
     }
 
     fn put(&mut self, key: K, value: V) -> Option<V> {
-        if let Some(&slot) = self.map.get(&key) {
-            let old = mem::replace(&mut self.entry_mut(slot).value, value);
-            self.policy.on_update(slot);
-            self.stats.updates += 1;
-            return Some(old);
-        }
-        while self.max_entries.is_some_and(|max| self.map.len() >= max) {
-            if !self.evict_coldest() {
-                break;
-            }
-        }
-        self.attach(Entry { key, value });
-        self.stats.insertions += 1;
-        None
+        self.store(key, value, self.default_ttl)
     }
 
     fn remove(&mut self, key: &K) -> Option<V> {
-        let slot = *self.map.get(key)?;
+        let slot = self.live_slot(key)?;
         let entry = self.detach(slot);
         self.stats.removals += 1;
         Some(entry.value)
@@ -298,6 +430,22 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::builder::CacheBuilder;
+    use crate::clock::ManualClock;
+
+    const SECOND: Duration = Duration::from_secs(1);
+
+    /// An LRU cache with a ten second default TTL driven by a manual clock.
+    fn expiring_cache(max_entries: usize) -> (LruCache<&'static str, i32>, ManualClock) {
+        let clock = ManualClock::new();
+        let cache = CacheBuilder::new()
+            .max_entries(max_entries)
+            .ttl(10 * SECOND)
+            .clock(clock.clone())
+            .build_with(Lru::new())
+            .unwrap();
+        (cache, clock)
+    }
 
     #[test]
     fn put_then_get_returns_value() {
@@ -425,6 +573,136 @@ mod tests {
         assert!(!cache.contains_key(&"c"), "the newcomer has the fewest uses");
         assert!(cache.contains_key(&"a"));
         assert!(cache.contains_key(&"d"));
+    }
+
+    #[test]
+    fn entry_expires_exactly_at_its_deadline() {
+        let (mut cache, clock) = expiring_cache(4);
+        cache.put("a", 1);
+        clock.advance(9 * SECOND);
+        assert_eq!(cache.get(&"a"), Some(&1));
+        clock.advance(SECOND);
+        assert_eq!(cache.get(&"a"), None);
+        assert_eq!(cache.len(), 0, "a failed lookup removes the expired entry");
+        let stats = cache.stats();
+        assert_eq!((stats.hits, stats.misses, stats.expirations), (1, 1, 1));
+    }
+
+    #[test]
+    fn reads_do_not_extend_life_but_writes_do() {
+        let (mut cache, clock) = expiring_cache(4);
+        cache.put("read", 1);
+        cache.put("written", 1);
+        clock.advance(6 * SECOND);
+        cache.get(&"read");
+        assert_eq!(cache.put("written", 2), Some(1));
+        clock.advance(6 * SECOND);
+        assert_eq!(cache.get(&"read"), None);
+        assert_eq!(cache.get(&"written"), Some(&2));
+    }
+
+    #[test]
+    fn peek_hides_expired_entries_without_removing_them() {
+        let (mut cache, clock) = expiring_cache(4);
+        cache.put("a", 1);
+        clock.advance(10 * SECOND);
+        assert_eq!(cache.peek(&"a"), None);
+        assert!(!cache.contains_key(&"a"));
+        assert_eq!(cache.len(), 1, "peek cannot remove, so the entry lingers");
+        assert_eq!(cache.stats().expirations, 0);
+    }
+
+    #[test]
+    fn per_entry_ttl_overrides_the_default() {
+        let (mut cache, clock) = expiring_cache(4);
+        cache.put("default", 1);
+        cache.put_with_ttl("short", 2, 2 * SECOND);
+        cache.put_with_ttl("long", 3, 60 * SECOND);
+        assert_eq!(cache.remaining_ttl(&"short"), Some(2 * SECOND));
+        clock.advance(2 * SECOND);
+        assert_eq!(cache.remaining_ttl(&"short"), None);
+        assert_eq!(cache.remaining_ttl(&"default"), Some(8 * SECOND));
+        clock.advance(20 * SECOND);
+        assert!(!cache.contains_key(&"default"));
+        assert!(cache.contains_key(&"long"));
+        assert_eq!(cache.remaining_ttl(&"missing"), None);
+    }
+
+    #[test]
+    fn entries_without_ttl_have_no_remaining_ttl() {
+        let mut cache = LruCache::new(1);
+        cache.put("a", 1);
+        assert_eq!(cache.default_ttl(), None);
+        assert_eq!(cache.remaining_ttl(&"a"), None);
+    }
+
+    #[test]
+    fn zero_ttl_put_acts_as_remove() {
+        let (mut cache, _clock) = expiring_cache(4);
+        cache.put("a", 1);
+        assert_eq!(cache.put_with_ttl("a", 2, Duration::ZERO), Some(1));
+        assert!(cache.is_empty());
+        assert_eq!(cache.put_with_ttl("b", 2, Duration::ZERO), None);
+        assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn purge_removes_only_expired_entries() {
+        let (mut cache, clock) = expiring_cache(8);
+        cache.put("old1", 1);
+        cache.put("old2", 2);
+        clock.advance(5 * SECOND);
+        cache.put("young", 3);
+        clock.advance(5 * SECOND);
+        assert_eq!(cache.len(), 3);
+        assert_eq!(cache.purge_expired(), 2);
+        assert_eq!(cache.len(), 1);
+        assert!(cache.contains_key(&"young"));
+        assert_eq!(cache.stats().expirations, 2);
+        assert_eq!(cache.purge_expired(), 0);
+    }
+
+    #[test]
+    fn writing_over_an_expired_key_is_an_insertion() {
+        let (mut cache, clock) = expiring_cache(4);
+        cache.put("a", 1);
+        clock.advance(10 * SECOND);
+        assert_eq!(cache.put("a", 2), None, "the old value is already gone");
+        let stats = cache.stats();
+        assert_eq!((stats.insertions, stats.updates, stats.expirations), (2, 0, 1));
+        assert_eq!(cache.get(&"a"), Some(&2));
+    }
+
+    #[test]
+    fn removing_an_expired_key_returns_nothing() {
+        let (mut cache, clock) = expiring_cache(4);
+        cache.put("a", 1);
+        clock.advance(10 * SECOND);
+        assert_eq!(cache.remove(&"a"), None);
+        assert_eq!(cache.stats().removals, 0);
+        assert_eq!(cache.stats().expirations, 1);
+    }
+
+    #[test]
+    fn expired_victim_counts_as_expiration_not_eviction() {
+        let (mut cache, clock) = expiring_cache(1);
+        cache.put("a", 1);
+        clock.advance(10 * SECOND);
+        cache.put("b", 2);
+        let stats = cache.stats();
+        assert_eq!((stats.evictions, stats.expirations), (0, 1));
+    }
+
+    #[test]
+    fn coldest_accessors_skip_expired_entries() {
+        let (mut cache, clock) = expiring_cache(4);
+        cache.put_with_ttl("dying", 1, SECOND);
+        cache.put("alive", 2);
+        clock.advance(SECOND);
+        assert_eq!(cache.peek_coldest(), Some((&"alive", &2)));
+        assert_eq!(cache.pop_coldest(), Some(("alive", 2)));
+        assert!(cache.is_empty());
+        assert_eq!(cache.pop_coldest(), None);
     }
 
     #[test]

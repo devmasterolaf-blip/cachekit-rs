@@ -20,6 +20,8 @@ pub struct Stats {
     pub updates: u64,
     /// Entries removed by the eviction policy to make room.
     pub evictions: u64,
+    /// Entries removed because their time to live ran out.
+    pub expirations: u64,
     /// Entries removed explicitly by the caller.
     pub removals: u64,
 }
@@ -33,6 +35,7 @@ impl Stats {
             insertions: 0,
             updates: 0,
             evictions: 0,
+            expirations: 0,
             removals: 0,
         }
     }
@@ -81,6 +84,7 @@ impl AddAssign for Stats {
         self.insertions += other.insertions;
         self.updates += other.updates;
         self.evictions += other.evictions;
+        self.expirations += other.expirations;
         self.removals += other.removals;
     }
 }
@@ -100,6 +104,7 @@ impl fmt::Display for Stats {
         writeln!(f, "insertions:  {}", self.insertions)?;
         writeln!(f, "updates:     {}", self.updates)?;
         writeln!(f, "evictions:   {}", self.evictions)?;
+        writeln!(f, "expirations: {}", self.expirations)?;
         write!(f, "removals:    {}", self.removals)
     }
 }
@@ -136,6 +141,7 @@ mod tests {
             insertions: 3,
             updates: 4,
             evictions: 5,
+            expirations: 7,
             removals: 6,
         };
         let total: Stats = [a, a, a].into_iter().sum();
@@ -144,6 +150,7 @@ mod tests {
         assert_eq!(total.insertions, 9);
         assert_eq!(total.updates, 12);
         assert_eq!(total.evictions, 15);
+        assert_eq!(total.expirations, 21);
         assert_eq!(total.removals, 18);
     }
 
@@ -157,6 +164,6 @@ mod tests {
         let text = stats.to_string();
         assert!(text.contains("hit rate:    50.00%"));
         assert!(text.contains("evictions:   0"));
-        assert_eq!(text.lines().count(), 8);
+        assert_eq!(text.lines().count(), 9);
     }
 }
