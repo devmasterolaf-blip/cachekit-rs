@@ -16,7 +16,7 @@ pub mod policy;
 pub mod stats;
 
 pub use builder::CacheBuilder;
-pub use cache::{Cache, DynCache, FifoCache, LfuCache, LruCache, PolicyCache};
+pub use cache::{Cache, DynCache, FifoCache, LfuCache, LruCache, PolicyCache, Weigher};
 pub use clock::{Clock, ManualClock, SystemClock};
 pub use error::{ConfigError, ParsePolicyError};
 pub use policy::{Policy, PolicyKind};

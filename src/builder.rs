@@ -1,11 +1,10 @@
 //! Validated cache construction.
 
 use std::hash::Hash;
-use std::marker::PhantomData;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::cache::{DynCache, PolicyCache, Settings};
+use crate::cache::{DynCache, PolicyCache, Settings, Weigher};
 use crate::clock::Clock;
 use crate::error::ConfigError;
 use crate::policy::{Policy, PolicyKind};
@@ -26,9 +25,10 @@ use crate::policy::{Policy, PolicyKind};
 pub struct CacheBuilder<K, V> {
     policy: PolicyKind,
     max_entries: Option<usize>,
+    max_weight: Option<u64>,
+    weigher: Option<Weigher<K, V>>,
     ttl: Option<Duration>,
     clock: Option<Arc<dyn Clock>>,
-    marker: PhantomData<fn(K, V)>,
 }
 
 impl<K, V> Default for CacheBuilder<K, V> {
@@ -36,9 +36,10 @@ impl<K, V> Default for CacheBuilder<K, V> {
         CacheBuilder {
             policy: PolicyKind::Lru,
             max_entries: None,
+            max_weight: None,
+            weigher: None,
             ttl: None,
             clock: None,
-            marker: PhantomData,
         }
     }
 }
@@ -65,6 +66,24 @@ where
         self
     }
 
+    /// Limits the total weight of all entries, as measured by the
+    /// [`weigher`](Self::weigher). Can be combined with
+    /// [`max_entries`](Self::max_entries); both bounds are then enforced.
+    pub fn max_weight(mut self, max_weight: u64) -> Self {
+        self.max_weight = Some(max_weight);
+        self
+    }
+
+    /// Sets the function that measures an entry's weight, for example the
+    /// byte length of the value.
+    pub fn weigher<F>(mut self, weigher: F) -> Self
+    where
+        F: Fn(&K, &V) -> u64 + Send + Sync + 'static,
+    {
+        self.weigher = Some(Arc::new(weigher));
+        self
+    }
+
     /// Expires entries this long after they were last written. Individual
     /// entries can override it with
     /// [`put_with_ttl`](PolicyCache::put_with_ttl).
@@ -82,10 +101,19 @@ where
 
     /// Checks the configuration without building anything.
     pub fn validate(&self) -> Result<(), ConfigError> {
-        match self.max_entries {
-            None => return Err(ConfigError::Unbounded),
-            Some(0) => return Err(ConfigError::ZeroCapacity),
-            Some(_) => {}
+        if self.max_entries.is_none() && self.max_weight.is_none() {
+            return Err(ConfigError::Unbounded);
+        }
+        if self.max_entries == Some(0) {
+            return Err(ConfigError::ZeroCapacity);
+        }
+        if self.max_weight == Some(0) {
+            return Err(ConfigError::ZeroMaxWeight);
+        }
+        match (self.max_weight, &self.weigher) {
+            (Some(_), None) => return Err(ConfigError::MissingWeigher),
+            (None, Some(_)) => return Err(ConfigError::UnusedWeigher),
+            _ => {}
         }
         if self.ttl.is_some_and(|ttl| ttl.is_zero()) {
             return Err(ConfigError::ZeroTtl);
@@ -108,9 +136,11 @@ where
         Ok(PolicyCache::from_settings(policy, self.into_settings()))
     }
 
-    fn into_settings(self) -> Settings {
+    fn into_settings(self) -> Settings<K, V> {
         let mut settings = Settings::new();
         settings.max_entries = self.max_entries;
+        settings.max_weight = self.max_weight;
+        settings.weigher = self.weigher;
         settings.ttl = self.ttl;
         if let Some(clock) = self.clock {
             settings.clock = clock;
@@ -149,6 +179,35 @@ mod tests {
     fn zero_entries_is_rejected() {
         let result = CacheBuilder::<u32, u32>::new().max_entries(0).build();
         assert_eq!(result.err(), Some(ConfigError::ZeroCapacity));
+    }
+
+    #[test]
+    fn weight_settings_must_come_in_pairs() {
+        let no_weigher = CacheBuilder::<u32, String>::new().max_weight(10).build();
+        assert_eq!(no_weigher.err(), Some(ConfigError::MissingWeigher));
+
+        let no_bound = CacheBuilder::<u32, String>::new()
+            .max_entries(10)
+            .weigher(|_, v| v.len() as u64)
+            .build();
+        assert_eq!(no_bound.err(), Some(ConfigError::UnusedWeigher));
+
+        let zero = CacheBuilder::<u32, String>::new()
+            .max_weight(0)
+            .weigher(|_, v| v.len() as u64)
+            .build();
+        assert_eq!(zero.err(), Some(ConfigError::ZeroMaxWeight));
+    }
+
+    #[test]
+    fn weight_bound_alone_is_enough() {
+        let cache = CacheBuilder::<u32, String>::new()
+            .max_weight(64)
+            .weigher(|_, v| v.len() as u64)
+            .build()
+            .unwrap();
+        assert_eq!(cache.max_entries(), None);
+        assert_eq!(cache.max_weight(), Some(64));
     }
 
     #[test]

@@ -11,6 +11,12 @@ pub enum ConfigError {
     Unbounded,
     /// `max_entries` was set to zero.
     ZeroCapacity,
+    /// `max_weight` was set to zero.
+    ZeroMaxWeight,
+    /// `max_weight` was set but no weigher was given to measure entries.
+    MissingWeigher,
+    /// A weigher was given but there is no `max_weight` for it to enforce.
+    UnusedWeigher,
     /// The time to live was zero, which would expire entries immediately.
     ZeroTtl,
 }
@@ -19,10 +25,22 @@ impl fmt::Display for ConfigError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ConfigError::Unbounded => {
-                write!(f, "the cache has no capacity bound; set max_entries")
+                write!(
+                    f,
+                    "the cache has no capacity bound; set max_entries or max_weight"
+                )
             }
             ConfigError::ZeroCapacity => {
                 write!(f, "max_entries must be at least 1")
+            }
+            ConfigError::ZeroMaxWeight => {
+                write!(f, "max_weight must be at least 1")
+            }
+            ConfigError::MissingWeigher => {
+                write!(f, "max_weight needs a weigher to measure entries")
+            }
+            ConfigError::UnusedWeigher => {
+                write!(f, "a weigher was configured without max_weight")
             }
             ConfigError::ZeroTtl => {
                 write!(f, "the time to live must be longer than zero")

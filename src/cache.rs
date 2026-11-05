@@ -26,6 +26,9 @@ pub trait Cache<K, V> {
 
     /// Stores `value` under `key` and returns the value it replaced, if any.
     /// Other entries are evicted as needed to stay within capacity.
+    ///
+    /// In a weight-bounded cache a value heavier than the whole cache is
+    /// rejected: it is not stored, and the key ends up absent.
     fn put(&mut self, key: K, value: V) -> Option<V>;
 
     /// Removes `key` and returns its value.
@@ -62,9 +65,17 @@ pub trait Cache<K, V> {
 struct Entry<K, V> {
     key: K,
     value: V,
+    /// Weight assigned by the weigher when the value was written.
+    weight: u64,
     /// Clock reading at which the entry stops being valid.
     expires_at: Option<Duration>,
 }
+
+/// Computes the weight of an entry for weight-bounded caches.
+///
+/// The weigher runs once per write. It should be cheap and must return the
+/// same weight for the same value, since the cache keeps a running total.
+pub type Weigher<K, V> = Arc<dyn Fn(&K, &V) -> u64 + Send + Sync>;
 
 /// A bounded cache whose eviction order is decided by the policy `P`.
 ///
@@ -89,6 +100,9 @@ pub struct PolicyCache<K, V, P> {
     free: Vec<usize>,
     policy: P,
     max_entries: Option<usize>,
+    max_weight: Option<u64>,
+    weigher: Option<Weigher<K, V>>,
+    total_weight: u64,
     default_ttl: Option<Duration>,
     clock: Arc<dyn Clock>,
     stats: Stats,
@@ -96,17 +110,21 @@ pub struct PolicyCache<K, V, P> {
 
 /// Settings handed from the builder to the engine. The builder validates
 /// them; the engine trusts what it is given.
-pub(crate) struct Settings {
+pub(crate) struct Settings<K, V> {
     pub(crate) max_entries: Option<usize>,
+    pub(crate) max_weight: Option<u64>,
+    pub(crate) weigher: Option<Weigher<K, V>>,
     pub(crate) ttl: Option<Duration>,
     pub(crate) clock: Arc<dyn Clock>,
 }
 
-impl Settings {
+impl<K, V> Settings<K, V> {
     /// Settings with no bounds, no expiry and the system clock.
     pub(crate) fn new() -> Self {
         Settings {
             max_entries: None,
+            max_weight: None,
+            weigher: None,
             ttl: None,
             clock: Arc::new(SystemClock::new()),
         }
@@ -158,13 +176,16 @@ where
         Self::from_settings(policy, settings)
     }
 
-    pub(crate) fn from_settings(policy: P, settings: Settings) -> Self {
+    pub(crate) fn from_settings(policy: P, settings: Settings<K, V>) -> Self {
         PolicyCache {
             map: HashMap::new(),
             slots: Vec::new(),
             free: Vec::new(),
             policy,
             max_entries: settings.max_entries,
+            max_weight: settings.max_weight,
+            weigher: settings.weigher,
+            total_weight: 0,
             default_ttl: settings.ttl,
             clock: settings.clock,
             stats: Stats::new(),
@@ -174,6 +195,26 @@ where
     /// Maximum number of entries the cache will hold, if bounded by count.
     pub fn max_entries(&self) -> Option<usize> {
         self.max_entries
+    }
+
+    /// Maximum total weight the cache will hold, if bounded by weight.
+    pub fn max_weight(&self) -> Option<u64> {
+        self.max_weight
+    }
+
+    /// Sum of the weights of all stored entries. Without a weigher every
+    /// entry weighs 1.
+    pub fn weight(&self) -> u64 {
+        self.total_weight
+    }
+
+    /// Weight recorded for `key` when it was last written.
+    pub fn weight_of(&self, key: &K) -> Option<u64> {
+        let slot = *self.map.get(key)?;
+        if self.is_expired(slot) {
+            return None;
+        }
+        Some(self.entry(slot).weight)
     }
 
     /// Name of the eviction policy, for example `"lru"`.
@@ -289,28 +330,76 @@ where
         }
     }
 
+    fn weigh(&self, key: &K, value: &V) -> u64 {
+        match &self.weigher {
+            Some(weigher) => weigher(key, value),
+            None => 1,
+        }
+    }
+
+    /// Returns `true` if the cache would exceed a bound after growing by the
+    /// given number of entries and weight.
+    fn exceeds_limits(&self, extra_entries: usize, extra_weight: u64) -> bool {
+        let too_many = self
+            .max_entries
+            .is_some_and(|max| self.map.len() + extra_entries > max);
+        let too_heavy = self
+            .max_weight
+            .is_some_and(|max| self.total_weight.saturating_add(extra_weight) > max);
+        too_many || too_heavy
+    }
+
     fn store(&mut self, key: K, value: V, ttl: Option<Duration>) -> Option<V> {
+        let weight = self.weigh(&key, &value);
+        if self.max_weight.is_some_and(|max| weight > max) {
+            // The value can never fit, even in an empty cache. Whatever was
+            // stored under the key is stale now, so it goes as well.
+            self.stats.rejections += 1;
+            let slot = self.live_slot(&key)?;
+            return Some(self.detach(slot).value);
+        }
         let expires_at = self.deadline(ttl);
         if let Some(slot) = self.live_slot(&key) {
             let entry = self.entry_mut(slot);
             entry.expires_at = expires_at;
+            let old_weight = mem::replace(&mut entry.weight, weight);
             let old = mem::replace(&mut entry.value, value);
+            self.total_weight = (self.total_weight - old_weight).saturating_add(weight);
             self.policy.on_update(slot);
             self.stats.updates += 1;
+            self.evict_others_until_fit(slot);
             return Some(old);
         }
-        while self.max_entries.is_some_and(|max| self.map.len() >= max) {
-            if !self.evict_coldest() {
+        while self.exceeds_limits(1, weight) {
+            let Some(victim) = self.policy.coldest() else {
                 break;
-            }
+            };
+            self.evict(victim);
         }
         self.attach(Entry {
             key,
             value,
+            weight,
             expires_at,
         });
         self.stats.insertions += 1;
         None
+    }
+
+    /// After the entry in `keep` grew, evicts other entries in eviction order
+    /// until the cache fits its bounds again. `keep` itself always fits
+    /// because oversized values are rejected before they are stored.
+    fn evict_others_until_fit(&mut self, keep: usize) {
+        while self.exceeds_limits(0, 0) {
+            let victim = match self.policy.coldest() {
+                Some(slot) if slot == keep => self.policy.next(slot),
+                other => other,
+            };
+            let Some(victim) = victim else {
+                break;
+            };
+            self.evict(victim);
+        }
     }
 
     fn entry(&self, slot: usize) -> &Entry<K, V> {
@@ -340,6 +429,7 @@ where
         };
         self.map.insert(key, slot);
         self.policy.on_insert(slot);
+        self.total_weight = self.total_weight.saturating_add(self.entry(slot).weight);
         slot
     }
 
@@ -351,24 +441,19 @@ where
         self.map.remove(&entry.key);
         self.policy.on_remove(slot);
         self.free.push(slot);
+        self.total_weight -= entry.weight;
         entry
     }
 
-    /// Makes room by removing the coldest entry. If that entry has already
+    /// Makes room by removing the entry in `slot`. If that entry has already
     /// expired the removal is counted as an expiration rather than an
-    /// eviction. Returns `false` if there was nothing left to remove.
-    fn evict_coldest(&mut self) -> bool {
-        match self.policy.coldest() {
-            Some(slot) if self.is_expired(slot) => {
-                self.expire(slot);
-                true
-            }
-            Some(slot) => {
-                self.detach(slot);
-                self.stats.evictions += 1;
-                true
-            }
-            None => false,
+    /// eviction.
+    fn evict(&mut self, slot: usize) {
+        if self.is_expired(slot) {
+            self.expire(slot);
+        } else {
+            self.detach(slot);
+            self.stats.evictions += 1;
         }
     }
 }
@@ -416,6 +501,7 @@ where
         self.slots.clear();
         self.free.clear();
         self.policy.clear();
+        self.total_weight = 0;
     }
 
     fn stats(&self) -> Stats {
@@ -445,6 +531,19 @@ mod tests {
             .build_with(Lru::new())
             .unwrap();
         (cache, clock)
+    }
+
+    /// A cache bounded by the total length of its string values.
+    fn weighted_cache<P: Policy>(policy: P, max_weight: u64) -> PolicyCache<&'static str, String, P> {
+        CacheBuilder::new()
+            .max_weight(max_weight)
+            .weigher(|_key: &&'static str, value: &String| value.len() as u64)
+            .build_with(policy)
+            .unwrap()
+    }
+
+    fn text(len: usize) -> String {
+        "x".repeat(len)
     }
 
     #[test]
@@ -703,6 +802,149 @@ mod tests {
         assert_eq!(cache.pop_coldest(), Some(("alive", 2)));
         assert!(cache.is_empty());
         assert_eq!(cache.pop_coldest(), None);
+    }
+
+    #[test]
+    fn weight_bound_evicts_until_the_new_entry_fits() {
+        let mut cache = weighted_cache(Lru::new(), 10);
+        cache.put("a", text(4));
+        cache.put("b", text(4));
+        assert_eq!(cache.weight(), 8);
+        cache.put("c", text(4));
+        assert!(!cache.contains_key(&"a"));
+        assert_eq!(cache.weight(), 8);
+        assert_eq!(cache.weight_of(&"c"), Some(4));
+        assert_eq!(cache.stats().evictions, 1);
+    }
+
+    #[test]
+    fn one_heavy_entry_can_evict_several_light_ones() {
+        let mut cache = weighted_cache(Lru::new(), 10);
+        for key in ["a", "b", "c", "d", "e"] {
+            cache.put(key, text(2));
+        }
+        cache.put("big", text(7));
+        assert_eq!(cache.len(), 2);
+        assert!(cache.contains_key(&"e"));
+        assert!(cache.contains_key(&"big"));
+        assert_eq!(cache.weight(), 9);
+        assert_eq!(cache.stats().evictions, 4);
+    }
+
+    #[test]
+    fn entry_weighing_exactly_the_bound_is_accepted() {
+        let mut cache = weighted_cache(Lru::new(), 10);
+        cache.put("a", text(3));
+        cache.put("full", text(10));
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache.weight(), 10);
+        assert_eq!(cache.stats().rejections, 0);
+    }
+
+    #[test]
+    fn oversized_value_is_rejected_and_stale_value_dropped() {
+        let mut cache = weighted_cache(Lru::new(), 10);
+        cache.put("a", text(3));
+        cache.put("b", text(3));
+        assert_eq!(cache.put("c", text(11)), None);
+        assert!(!cache.contains_key(&"c"));
+        assert_eq!(cache.len(), 2, "a rejected write must not evict anything");
+        assert_eq!(cache.put("a", text(11)), Some(text(3)));
+        assert!(!cache.contains_key(&"a"));
+        assert_eq!(cache.weight(), 3);
+        let stats = cache.stats();
+        assert_eq!((stats.rejections, stats.evictions, stats.insertions), (2, 0, 2));
+    }
+
+    #[test]
+    fn growing_update_keeps_the_updated_entry_under_fifo() {
+        let mut cache = weighted_cache(Fifo::new(), 10);
+        cache.put("first", text(2));
+        cache.put("second", text(4));
+        cache.put("third", text(4));
+        // "first" is the next FIFO victim, but it is the entry being written.
+        assert_eq!(cache.put("first", text(6)), Some(text(2)));
+        assert!(cache.contains_key(&"first"));
+        assert!(!cache.contains_key(&"second"));
+        assert!(cache.contains_key(&"third"));
+        assert_eq!(cache.weight(), 10);
+    }
+
+    #[test]
+    fn growing_update_keeps_the_updated_entry_under_lfu() {
+        let mut cache = weighted_cache(Lfu::new(), 10);
+        cache.put("cold", text(2));
+        cache.put("hot", text(8));
+        for _ in 0..5 {
+            cache.get(&"hot");
+        }
+        cache.put("cold", text(9));
+        assert!(cache.contains_key(&"cold"));
+        assert!(!cache.contains_key(&"hot"));
+        assert_eq!(cache.weight(), 9);
+    }
+
+    #[test]
+    fn shrinking_update_releases_weight() {
+        let mut cache = weighted_cache(Lru::new(), 10);
+        cache.put("a", text(8));
+        cache.put("a", text(1));
+        assert_eq!(cache.weight(), 1);
+        cache.put("b", text(9));
+        assert_eq!(cache.len(), 2);
+        assert_eq!(cache.stats().evictions, 0);
+    }
+
+    #[test]
+    fn zero_weight_entries_never_force_weight_eviction() {
+        let mut cache = weighted_cache(Lru::new(), 5);
+        cache.put("full", text(5));
+        for key in ["e1", "e2", "e3"] {
+            cache.put(key, String::new());
+        }
+        assert_eq!(cache.len(), 4);
+        assert_eq!(cache.weight(), 5);
+    }
+
+    #[test]
+    fn entry_and_weight_bounds_apply_together() {
+        let mut cache: LruCache<&str, String> = CacheBuilder::new()
+            .max_entries(2)
+            .max_weight(10)
+            .weigher(|_: &&str, value: &String| value.len() as u64)
+            .build_with(Lru::new())
+            .unwrap();
+        cache.put("a", text(1));
+        cache.put("b", text(1));
+        cache.put("c", text(1));
+        assert_eq!(cache.len(), 2, "entry bound");
+        cache.put("d", text(10));
+        assert_eq!(cache.len(), 1, "weight bound");
+        assert!(cache.contains_key(&"d"));
+    }
+
+    #[test]
+    fn removal_and_clear_release_weight() {
+        let mut cache = weighted_cache(Lru::new(), 10);
+        cache.put("a", text(4));
+        cache.put("b", text(5));
+        cache.remove(&"a");
+        assert_eq!(cache.weight(), 5);
+        cache.clear();
+        assert_eq!(cache.weight(), 0);
+        cache.put("c", text(10));
+        assert_eq!(cache.weight(), 10);
+    }
+
+    #[test]
+    fn unweighted_cache_counts_one_per_entry() {
+        let mut cache = LruCache::new(3);
+        cache.put(1, 1);
+        cache.put(2, 2);
+        assert_eq!(cache.weight(), 2);
+        assert_eq!(cache.weight_of(&1), Some(1));
+        assert_eq!(cache.weight_of(&9), None);
+        assert_eq!(cache.max_weight(), None);
     }
 
     #[test]
