@@ -82,9 +82,59 @@ impl fmt::Display for ParsePolicyError {
 
 impl Error for ParsePolicyError {}
 
+/// A loader passed to
+/// [`get_or_try_insert_with`](crate::PolicyCache::get_or_try_insert_with)
+/// failed, so no value was cached.
+///
+/// The loader's own error is kept and can be inspected with
+/// [`get_ref`](Self::get_ref), taken out with
+/// [`into_inner`](Self::into_inner), or reached through
+/// [`Error::source`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoadError<E> {
+    source: E,
+}
+
+impl<E> LoadError<E> {
+    pub(crate) fn new(source: E) -> Self {
+        LoadError { source }
+    }
+
+    /// The error returned by the loader.
+    pub fn get_ref(&self) -> &E {
+        &self.source
+    }
+
+    /// Unwraps the error returned by the loader.
+    pub fn into_inner(self) -> E {
+        self.source
+    }
+}
+
+impl<E: fmt::Display> fmt::Display for LoadError<E> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "cache loader failed: {}", self.source)
+    }
+}
+
+impl<E: Error + 'static> Error for LoadError<E> {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn load_error_wraps_the_loader_error() {
+        let err = LoadError::new(ConfigError::ZeroTtl);
+        assert_eq!(err.get_ref(), &ConfigError::ZeroTtl);
+        assert!(err.to_string().starts_with("cache loader failed: "));
+        assert!(err.source().is_some());
+        assert_eq!(err.into_inner(), ConfigError::ZeroTtl);
+    }
 
     #[test]
     fn config_errors_have_actionable_messages() {

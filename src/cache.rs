@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::clock::{Clock, SystemClock};
+use crate::error::LoadError;
 use crate::event::{Listener, RemovalCause};
 use crate::policy::{eviction_order, Fifo, Lfu, Lru, Policy};
 use crate::stats::Stats;
@@ -253,6 +254,51 @@ where
             return self.remove(&key);
         }
         self.store(key, value, Some(ttl))
+    }
+
+    /// Returns the value for `key`, computing and storing it with `loader`
+    /// if it is missing or expired.
+    ///
+    /// The lookup counts as a hit or a miss like [`get`](Cache::get). The
+    /// loaded value is returned even when the cache declines to keep it
+    /// because it is heavier than the whole cache.
+    pub fn get_or_insert_with<F>(&mut self, key: K, loader: F) -> V
+    where
+        V: Clone,
+        F: FnOnce(&K) -> V,
+    {
+        if let Some(value) = self.get(&key) {
+            return value.clone();
+        }
+        let value = loader(&key);
+        self.stats.loads += 1;
+        self.put(key, value.clone());
+        value
+    }
+
+    /// Like [`get_or_insert_with`](Self::get_or_insert_with) for loaders
+    /// that can fail. A failed load stores nothing and is reported as a
+    /// [`LoadError`] wrapping the loader's error, so the next lookup runs
+    /// the loader again.
+    pub fn get_or_try_insert_with<F, E>(&mut self, key: K, loader: F) -> Result<V, LoadError<E>>
+    where
+        V: Clone,
+        F: FnOnce(&K) -> Result<V, E>,
+    {
+        if let Some(value) = self.get(&key) {
+            return Ok(value.clone());
+        }
+        match loader(&key) {
+            Ok(value) => {
+                self.stats.loads += 1;
+                self.put(key, value.clone());
+                Ok(value)
+            }
+            Err(error) => {
+                self.stats.load_failures += 1;
+                Err(LoadError::new(error))
+            }
+        }
     }
 
     /// Time left before `key` expires. `None` if the key is absent, already
@@ -1087,6 +1133,57 @@ mod tests {
         cache.put(1, 1);
         cache.put(2, 2);
         assert_eq!(*order.lock().unwrap(), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn loader_runs_only_on_a_miss() {
+        let mut cache = LruCache::new(2);
+        let mut calls = 0;
+        for _ in 0..3 {
+            let value = cache.get_or_insert_with("k", |key| {
+                calls += 1;
+                key.len() * 10
+            });
+            assert_eq!(value, 10);
+        }
+        assert_eq!(calls, 1);
+        let stats = cache.stats();
+        assert_eq!((stats.hits, stats.misses, stats.loads), (2, 1, 1));
+        assert_eq!(stats.insertions, 1);
+    }
+
+    #[test]
+    fn loader_runs_again_after_expiry() {
+        let (mut cache, clock) = expiring_cache(2);
+        assert_eq!(cache.get_or_insert_with("k", |_| 1), 1);
+        clock.advance(10 * SECOND);
+        assert_eq!(cache.get_or_insert_with("k", |_| 2), 2);
+        assert_eq!(cache.stats().loads, 2);
+    }
+
+    #[test]
+    fn failed_load_caches_nothing_and_keeps_the_error() {
+        let mut cache: LruCache<&str, i32> = LruCache::new(2);
+        let result = cache.get_or_try_insert_with("k", |_| "nope".parse::<i32>());
+        let error = result.unwrap_err();
+        assert!(error.to_string().starts_with("cache loader failed: "));
+        assert!(!cache.contains_key(&"k"));
+        assert_eq!(cache.stats().load_failures, 1);
+
+        let retry = cache.get_or_try_insert_with("k", |_| "7".parse::<i32>());
+        assert_eq!(retry, Ok(7));
+        assert_eq!(cache.peek(&"k"), Some(&7));
+        let stats = cache.stats();
+        assert_eq!((stats.loads, stats.load_failures, stats.misses), (1, 1, 2));
+    }
+
+    #[test]
+    fn oversized_loaded_value_is_returned_but_not_cached() {
+        let mut cache = weighted_cache(Lru::new(), 4);
+        let value = cache.get_or_insert_with("k", |_| text(9));
+        assert_eq!(value, text(9));
+        assert!(cache.is_empty());
+        assert_eq!(cache.stats().rejections, 1);
     }
 
     #[test]

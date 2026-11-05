@@ -19,7 +19,7 @@ pub mod stats;
 pub use builder::CacheBuilder;
 pub use cache::{Cache, DynCache, FifoCache, LfuCache, LruCache, PolicyCache, Weigher};
 pub use clock::{Clock, ManualClock, SystemClock};
-pub use error::{ConfigError, ParsePolicyError};
+pub use error::{ConfigError, LoadError, ParsePolicyError};
 pub use event::{Listener, RemovalCause};
 pub use policy::{Policy, PolicyKind};
 pub use stats::Stats;

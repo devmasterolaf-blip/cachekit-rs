@@ -26,6 +26,10 @@ pub struct Stats {
     pub removals: u64,
     /// Writes refused because the value was heavier than the whole cache.
     pub rejections: u64,
+    /// Loader calls that produced a value.
+    pub loads: u64,
+    /// Loader calls that returned an error.
+    pub load_failures: u64,
 }
 
 impl Stats {
@@ -40,6 +44,8 @@ impl Stats {
             expirations: 0,
             removals: 0,
             rejections: 0,
+            loads: 0,
+            load_failures: 0,
         }
     }
 
@@ -90,6 +96,8 @@ impl AddAssign for Stats {
         self.expirations += other.expirations;
         self.removals += other.removals;
         self.rejections += other.rejections;
+        self.loads += other.loads;
+        self.load_failures += other.load_failures;
     }
 }
 
@@ -110,7 +118,9 @@ impl fmt::Display for Stats {
         writeln!(f, "evictions:   {}", self.evictions)?;
         writeln!(f, "expirations: {}", self.expirations)?;
         writeln!(f, "removals:    {}", self.removals)?;
-        write!(f, "rejections:  {}", self.rejections)
+        writeln!(f, "rejections:  {}", self.rejections)?;
+        writeln!(f, "loads:       {}", self.loads)?;
+        write!(f, "load errors: {}", self.load_failures)
     }
 }
 
@@ -149,6 +159,8 @@ mod tests {
             expirations: 7,
             removals: 6,
             rejections: 8,
+            loads: 9,
+            load_failures: 10,
         };
         let total: Stats = [a, a, a].into_iter().sum();
         assert_eq!(total.hits, 3);
@@ -159,6 +171,8 @@ mod tests {
         assert_eq!(total.expirations, 21);
         assert_eq!(total.removals, 18);
         assert_eq!(total.rejections, 24);
+        assert_eq!(total.loads, 27);
+        assert_eq!(total.load_failures, 30);
     }
 
     #[test]
@@ -171,6 +185,6 @@ mod tests {
         let text = stats.to_string();
         assert!(text.contains("hit rate:    50.00%"));
         assert!(text.contains("evictions:   0"));
-        assert_eq!(text.lines().count(), 10);
+        assert_eq!(text.lines().count(), 12);
     }
 }
