@@ -9,6 +9,7 @@
 
 pub mod builder;
 pub mod cache;
+pub mod cli;
 pub mod clock;
 pub mod error;
 pub mod event;
