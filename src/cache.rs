@@ -79,12 +79,22 @@ pub struct PolicyCache<K, V, P> {
     slots: Vec<Option<Entry<K, V>>>,
     free: Vec<usize>,
     policy: P,
-    max_entries: usize,
+    max_entries: Option<usize>,
     stats: Stats,
+}
+
+/// Settings handed from the builder to the engine. The builder validates
+/// them; the engine trusts what it is given.
+pub(crate) struct Settings {
+    pub(crate) max_entries: Option<usize>,
 }
 
 /// A cache that evicts the least recently used entry.
 pub type LruCache<K, V> = PolicyCache<K, V, Lru>;
+
+/// A cache whose built-in policy was chosen at run time, as produced by
+/// [`CacheBuilder::build`](crate::CacheBuilder::build).
+pub type DynCache<K, V> = PolicyCache<K, V, Box<dyn Policy + Send>>;
 
 /// A cache that evicts the least frequently used entry.
 pub type LfuCache<K, V> = PolicyCache<K, V, Lfu>;
@@ -118,18 +128,27 @@ where
     /// Panics if `max_entries` is zero.
     pub fn with_policy(policy: P, max_entries: usize) -> Self {
         assert!(max_entries > 0, "a cache needs room for at least one entry");
+        Self::from_settings(
+            policy,
+            Settings {
+                max_entries: Some(max_entries),
+            },
+        )
+    }
+
+    pub(crate) fn from_settings(policy: P, settings: Settings) -> Self {
         PolicyCache {
             map: HashMap::new(),
             slots: Vec::new(),
             free: Vec::new(),
             policy,
-            max_entries,
+            max_entries: settings.max_entries,
             stats: Stats::new(),
         }
     }
 
-    /// Maximum number of entries the cache will hold.
-    pub fn max_entries(&self) -> usize {
+    /// Maximum number of entries the cache will hold, if bounded by count.
+    pub fn max_entries(&self) -> Option<usize> {
         self.max_entries
     }
 
@@ -239,7 +258,7 @@ where
             self.stats.updates += 1;
             return Some(old);
         }
-        while self.map.len() >= self.max_entries {
+        while self.max_entries.is_some_and(|max| self.map.len() >= max) {
             if !self.evict_coldest() {
                 break;
             }

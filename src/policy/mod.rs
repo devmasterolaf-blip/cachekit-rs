@@ -6,6 +6,11 @@
 //! should go first. Slot indices are small, dense and reused after removal,
 //! which lets policies keep their bookkeeping in plain vectors.
 
+use std::fmt;
+use std::str::FromStr;
+
+use crate::error::ParsePolicyError;
+
 mod fifo;
 mod lfu;
 mod lru;
@@ -95,6 +100,60 @@ impl<P: Policy + ?Sized> Policy for Box<P> {
     }
 }
 
+/// The eviction policies that ship with the crate, for choosing one at run
+/// time (from configuration or a command line flag).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PolicyKind {
+    /// Least recently used, see [`Lru`].
+    Lru,
+    /// Least frequently used, see [`Lfu`].
+    Lfu,
+    /// First in, first out, see [`Fifo`].
+    Fifo,
+}
+
+impl PolicyKind {
+    /// Every built-in policy, in a stable order.
+    pub const ALL: [PolicyKind; 3] = [PolicyKind::Lru, PolicyKind::Lfu, PolicyKind::Fifo];
+
+    /// Lowercase name, the same string [`Policy::name`] returns.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PolicyKind::Lru => "lru",
+            PolicyKind::Lfu => "lfu",
+            PolicyKind::Fifo => "fifo",
+        }
+    }
+
+    /// Creates a fresh, empty policy of this kind.
+    pub fn build(self) -> Box<dyn Policy + Send> {
+        match self {
+            PolicyKind::Lru => Box::new(Lru::new()),
+            PolicyKind::Lfu => Box::new(Lfu::new()),
+            PolicyKind::Fifo => Box::new(Fifo::new()),
+        }
+    }
+}
+
+impl fmt::Display for PolicyKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for PolicyKind {
+    type Err = ParsePolicyError;
+
+    /// Parses a policy name, ignoring ASCII case and surrounding whitespace.
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        let name = text.trim();
+        PolicyKind::ALL
+            .into_iter()
+            .find(|kind| kind.as_str().eq_ignore_ascii_case(name))
+            .ok_or_else(|| ParsePolicyError::new(name))
+    }
+}
+
 /// Collects the slots tracked by `policy` in eviction order, coldest first.
 pub fn eviction_order<P: Policy + ?Sized>(policy: &P) -> Vec<usize> {
     let mut order = Vec::with_capacity(policy.len());
@@ -104,4 +163,30 @@ pub fn eviction_order<P: Policy + ?Sized>(policy: &P) -> Vec<usize> {
         cursor = policy.next(slot);
     }
     order
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn kinds_round_trip_through_their_names() {
+        for kind in PolicyKind::ALL {
+            assert_eq!(kind.as_str().parse::<PolicyKind>(), Ok(kind));
+            assert_eq!(kind.build().name(), kind.as_str());
+            assert_eq!(kind.to_string(), kind.as_str());
+        }
+    }
+
+    #[test]
+    fn parsing_ignores_case_and_whitespace() {
+        assert_eq!(" LRU ".parse::<PolicyKind>(), Ok(PolicyKind::Lru));
+        assert_eq!("Fifo".parse::<PolicyKind>(), Ok(PolicyKind::Fifo));
+    }
+
+    #[test]
+    fn unknown_names_are_rejected() {
+        let err = "random".parse::<PolicyKind>().unwrap_err();
+        assert_eq!(err.name(), "random");
+    }
 }

@@ -7,12 +7,17 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod builder;
 pub mod cache;
 pub mod clock;
+pub mod error;
 pub mod list;
 pub mod policy;
 pub mod stats;
 
-pub use cache::{Cache, FifoCache, LfuCache, LruCache, PolicyCache};
+pub use builder::CacheBuilder;
+pub use cache::{Cache, DynCache, FifoCache, LfuCache, LruCache, PolicyCache};
 pub use clock::{Clock, ManualClock, SystemClock};
+pub use error::{ConfigError, ParsePolicyError};
+pub use policy::{Policy, PolicyKind};
 pub use stats::Stats;
