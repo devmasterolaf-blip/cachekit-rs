@@ -14,6 +14,7 @@ pub mod error;
 pub mod event;
 pub mod list;
 pub mod policy;
+pub mod snapshot;
 pub mod stats;
 pub mod sync;
 
@@ -25,5 +26,6 @@ pub use clock::{Clock, ManualClock, SystemClock};
 pub use error::{ConfigError, LoadError, ParsePolicyError};
 pub use event::{Listener, RemovalCause};
 pub use policy::{BoxedPolicy, Policy, PolicyKind};
+pub use snapshot::SnapshotError;
 pub use stats::Stats;
 pub use sync::{ShardedCache, SyncCache};
