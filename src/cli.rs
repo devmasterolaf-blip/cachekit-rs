@@ -119,8 +119,12 @@ pub fn run(args: &[String], stdin: &mut dyn BufRead, out: &mut dyn Write) -> Res
     let Some((command, rest)) = args.split_first() else {
         return Err(usage("missing command"));
     };
+    let wants_help = |arg: &String| arg == "--help" || arg == "-h";
     match command.as_str() {
         "help" | "--help" | "-h" => writeln!(out, "{USAGE}").map_err(CliError::Output),
+        "replay" | "compare" if rest.iter().any(wants_help) => {
+            writeln!(out, "{USAGE}").map_err(CliError::Output)
+        }
         "--version" | "-V" => {
             writeln!(out, "cachekit {}", env!("CARGO_PKG_VERSION")).map_err(CliError::Output)
         }
@@ -405,6 +409,20 @@ mod tests {
         }
         let version = run_with(&["--version"], "").unwrap();
         assert_eq!(version.trim(), format!("cachekit {}", env!("CARGO_PKG_VERSION")));
+    }
+
+    #[test]
+    fn help_is_printed_when_asked_for_after_a_command() {
+        for args in [
+            &["replay", "--help"][..],
+            &["compare", "-h"][..],
+            &["replay", "-", "--capacity", "2", "--help"][..],
+        ] {
+            let printed = run_with(args, "").unwrap();
+            assert!(printed.starts_with("cachekit - replay cache traces"), "{args:?}");
+        }
+        // An unknown command is still an error, with or without --help.
+        assert_eq!(usage_error(&["frobnicate", "--help"]), "unknown command 'frobnicate'");
     }
 
     #[test]
