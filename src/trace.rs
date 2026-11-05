@@ -16,11 +16,37 @@
 //! words; values run to the end of the line with surrounding whitespace
 //! trimmed. There is no quoting, so a key cannot contain whitespace and a
 //! `#` only starts a comment at the beginning of a line.
+//!
+//! [`replay`] runs parsed operations against a cache whose clock is a
+//! [`ManualClock`], so traces with `tick` lines exercise expiry without
+//! waiting:
+//!
+//! ```
+//! use cachekit::trace::{self, ReplaySummary};
+//! use cachekit::{Cache, CacheBuilder, ManualClock, PolicyKind};
+//!
+//! let ops = trace::parse("put a 1\nget a\nget b\n".as_bytes()).unwrap();
+//! let clock = ManualClock::new();
+//! let mut cache = CacheBuilder::new()
+//!     .policy(PolicyKind::Lru)
+//!     .max_entries(8)
+//!     .clock(clock.clone())
+//!     .build()
+//!     .unwrap();
+//! let summary: ReplaySummary = trace::replay(&mut cache, &clock, &ops);
+//! assert_eq!(summary.operations, 3);
+//! assert_eq!(cache.stats().hits, 1);
+//! assert_eq!(cache.stats().misses, 1);
+//! ```
 
 use std::error::Error;
 use std::fmt;
 use std::io::{self, BufRead};
 use std::time::Duration;
+
+use crate::cache::{Cache, PolicyCache};
+use crate::clock::ManualClock;
+use crate::policy::Policy;
 
 /// One operation of a trace.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -224,6 +250,64 @@ pub fn parse<R: BufRead>(input: R) -> Result<Vec<Op>, TraceError> {
     Ok(ops)
 }
 
+/// Totals of one [`replay`] run. Hit and miss counts live in the cache's
+/// own [`Stats`](crate::Stats).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReplaySummary {
+    /// Number of operations applied.
+    pub operations: usize,
+    /// Total time the `tick` operations moved the clock forward.
+    pub simulated: Duration,
+    /// Entries dropped by `purge` operations.
+    pub purged: usize,
+}
+
+/// Applies one operation to `cache`. `clock` must be the clock the cache
+/// was built with, otherwise `tick` has no effect on expiry. Returns the
+/// number of entries a `purge` dropped (zero for every other operation).
+pub fn apply<P: Policy>(
+    cache: &mut PolicyCache<String, String, P>,
+    clock: &ManualClock,
+    op: &Op,
+) -> usize {
+    match op {
+        Op::Get(key) => {
+            cache.get(key);
+        }
+        Op::Put(key, value) => {
+            cache.put(key.clone(), value.clone());
+        }
+        Op::Delete(key) => {
+            cache.remove(key);
+        }
+        Op::Tick(by) => clock.advance(*by),
+        Op::Purge => return cache.purge_expired(),
+        Op::Clear => cache.clear(),
+    }
+    0
+}
+
+/// Applies `ops` to `cache` in order and returns the totals.
+pub fn replay<'a, P, I>(
+    cache: &mut PolicyCache<String, String, P>,
+    clock: &ManualClock,
+    ops: I,
+) -> ReplaySummary
+where
+    P: Policy,
+    I: IntoIterator<Item = &'a Op>,
+{
+    let mut summary = ReplaySummary::default();
+    for op in ops {
+        summary.purged += apply(cache, clock, op);
+        summary.operations += 1;
+        if let Op::Tick(by) = op {
+            summary.simulated = summary.simulated.saturating_add(*by);
+        }
+    }
+    summary
+}
+
 /// Splits off the first whitespace-delimited word; the remainder is
 /// trimmed. Both halves are empty for blank input.
 fn split_word(text: &str) -> (&str, &str) {
@@ -266,6 +350,29 @@ fn no_arguments(op: &'static str, rest: &str) -> Result<(), LineError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::builder::CacheBuilder;
+    use crate::cache::DynCache;
+    use crate::policy::PolicyKind;
+
+    fn replayed(
+        policy: PolicyKind,
+        capacity: usize,
+        ttl: Option<Duration>,
+        text: &str,
+    ) -> (DynCache<String, String>, ReplaySummary) {
+        let clock = ManualClock::new();
+        let mut builder = CacheBuilder::new()
+            .policy(policy)
+            .max_entries(capacity)
+            .clock(clock.clone());
+        if let Some(ttl) = ttl {
+            builder = builder.ttl(ttl);
+        }
+        let mut cache = builder.build().unwrap();
+        let ops = parse(text.as_bytes()).unwrap();
+        let summary = replay(&mut cache, &clock, &ops);
+        (cache, summary)
+    }
 
     fn op(line: &str) -> Op {
         parse_line(line).unwrap().unwrap()
@@ -409,5 +516,52 @@ mod tests {
             assert_eq!(op(&original.to_string()), original);
             assert!(original.to_string().starts_with(original.name()));
         }
+    }
+
+    #[test]
+    fn replay_counts_hits_and_misses() {
+        let text = "put a 1\nput b 2\nget a\nget c\ndel b\nget b\n";
+        let (cache, summary) = replayed(PolicyKind::Lru, 4, None, text);
+        assert_eq!(summary.operations, 6);
+        assert_eq!(summary.simulated, Duration::ZERO);
+        let stats = cache.stats();
+        assert_eq!((stats.hits, stats.misses), (1, 2));
+        assert_eq!((stats.insertions, stats.removals), (2, 1));
+        assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn replay_shows_the_difference_between_policies() {
+        // "a" is read again before "c" arrives: LRU then evicts "b", FIFO
+        // still evicts "a" because it arrived first.
+        let text = "put a 1\nput b 2\nget a\nput c 3\nget a\nget b\n";
+        let (lru, _) = replayed(PolicyKind::Lru, 2, None, text);
+        let (fifo, _) = replayed(PolicyKind::Fifo, 2, None, text);
+        assert_eq!((lru.stats().hits, lru.stats().misses), (2, 1));
+        assert_eq!((fifo.stats().hits, fifo.stats().misses), (2, 1));
+        assert!(lru.contains_key(&"a".to_string()));
+        assert!(!fifo.contains_key(&"a".to_string()));
+        assert_eq!(lru.stats().evictions, 1);
+    }
+
+    #[test]
+    fn tick_drives_expiry_and_purge_is_counted() {
+        let text = "put a 1\ntick 400\nput b 2\ntick 700\nget a\npurge\ntick 500\npurge\n";
+        let (cache, summary) =
+            replayed(PolicyKind::Lru, 4, Some(Duration::from_secs(1)), text);
+        assert_eq!(summary.operations, 8);
+        assert_eq!(summary.simulated, Duration::from_millis(1600));
+        // "a" expired on lookup, "b" was dropped by the second purge.
+        assert_eq!(summary.purged, 1);
+        assert_eq!(cache.stats().expirations, 2);
+        assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn clear_is_replayed() {
+        let (cache, summary) = replayed(PolicyKind::Lfu, 4, None, "put a 1\nput b 2\nclear\n");
+        assert_eq!(summary.operations, 3);
+        assert!(cache.is_empty());
+        assert_eq!(cache.stats().removals, 2);
     }
 }
