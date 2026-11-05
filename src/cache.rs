@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::hash::Hash;
 use std::mem;
 
-use crate::policy::{Lru, Policy};
+use crate::policy::{Fifo, Lru, Policy};
 use crate::stats::Stats;
 
 /// Operations shared by every cache in this crate.
@@ -85,6 +85,9 @@ pub struct PolicyCache<K, V, P> {
 
 /// A cache that evicts the least recently used entry.
 pub type LruCache<K, V> = PolicyCache<K, V, Lru>;
+
+/// A cache that evicts entries in insertion order.
+pub type FifoCache<K, V> = PolicyCache<K, V, Fifo>;
 
 impl<K, V, P> PolicyCache<K, V, P>
 where
@@ -371,6 +374,19 @@ mod tests {
         assert_eq!(cache.pop_coldest(), Some(("b", 2)));
         assert_eq!(cache.pop_coldest(), Some(("a", 1)));
         assert_eq!(cache.pop_coldest(), None);
+    }
+
+    #[test]
+    fn fifo_ignores_reads_when_evicting() {
+        let mut cache = FifoCache::new(2);
+        cache.put("a", 1);
+        cache.put("b", 2);
+        cache.get(&"a");
+        cache.put("a", 10);
+        cache.put("c", 3);
+        assert!(!cache.contains_key(&"a"), "oldest key goes first");
+        assert!(cache.contains_key(&"b"));
+        assert_eq!(cache.policy_name(), "fifo");
     }
 
     #[test]

@@ -6,8 +6,10 @@
 //! should go first. Slot indices are small, dense and reused after removal,
 //! which lets policies keep their bookkeeping in plain vectors.
 
+mod fifo;
 mod lru;
 
+pub use fifo::Fifo;
 pub use lru::Lru;
 
 /// Bookkeeping needed to choose eviction victims.

@@ -12,5 +12,5 @@ pub mod list;
 pub mod policy;
 pub mod stats;
 
-pub use cache::{Cache, LruCache, PolicyCache};
+pub use cache::{Cache, FifoCache, LruCache, PolicyCache};
 pub use stats::Stats;
