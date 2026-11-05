@@ -15,6 +15,7 @@ use crate::cache::{Cache, DynCache};
 use crate::clock::ManualClock;
 use crate::error::ConfigError;
 use crate::policy::PolicyKind;
+use crate::snapshot::{self, SnapshotError};
 use crate::trace::{self, Op, ReplaySummary, TraceError};
 
 /// Help text printed by `cachekit help`.
@@ -36,6 +37,9 @@ Options:
   --capacity <n>      keep at most <n> entries
   --max-weight <n>    keep at most <n> bytes of keys plus values
   --ttl-ms <n>        expire entries <n> simulated milliseconds after a write
+  --load <file>       fill the cache from a snapshot before the replay
+                      (replay only)
+  --save <file>       write the final contents to a snapshot (replay only)
 
 At least one of --capacity and --max-weight is required.";
 
@@ -59,6 +63,13 @@ pub enum CliError {
         /// The underlying error.
         source: TraceError,
     },
+    /// A snapshot could not be loaded or saved.
+    Snapshot {
+        /// The path as given on the command line.
+        path: String,
+        /// The underlying error.
+        source: SnapshotError,
+    },
     /// Writing the report failed.
     Output(io::Error),
 }
@@ -80,6 +91,7 @@ impl fmt::Display for CliError {
             CliError::Usage(message) => f.write_str(message),
             CliError::Open { path, source } => write!(f, "cannot open '{path}': {source}"),
             CliError::Trace { path, source } => write!(f, "{path}: {source}"),
+            CliError::Snapshot { path, source } => write!(f, "{path}: {source}"),
             CliError::Output(source) => write!(f, "cannot write output: {source}"),
         }
     }
@@ -91,6 +103,7 @@ impl Error for CliError {
             CliError::Usage(_) => None,
             CliError::Open { source, .. } => Some(source),
             CliError::Trace { source, .. } => Some(source),
+            CliError::Snapshot { source, .. } => Some(source),
             CliError::Output(source) => Some(source),
         }
     }
@@ -121,6 +134,9 @@ pub fn run(args: &[String], stdin: &mut dyn BufRead, out: &mut dyn Write) -> Res
             if options.policy.is_some() {
                 return Err(usage("--policy cannot be used with compare"));
             }
+            if options.load.is_some() || options.save.is_some() {
+                return Err(usage("--load and --save cannot be used with compare"));
+            }
             let ops = read_trace(&options.trace, stdin)?;
             compare_command(&options, &ops, out)
         }
@@ -136,6 +152,8 @@ struct Options {
     capacity: Option<usize>,
     max_weight: Option<u64>,
     ttl: Option<Duration>,
+    load: Option<String>,
+    save: Option<String>,
 }
 
 impl Options {
@@ -145,6 +163,8 @@ impl Options {
         let mut capacity = None;
         let mut max_weight = None;
         let mut ttl = None;
+        let mut load = None;
+        let mut save = None;
 
         let mut args = args.iter();
         while let Some(arg) = args.next() {
@@ -176,6 +196,8 @@ impl Options {
                 "--capacity" => capacity = Some(number(name, &value()?)?),
                 "--max-weight" => max_weight = Some(number(name, &value()?)?),
                 "--ttl-ms" => ttl = Some(Duration::from_millis(number(name, &value()?)?)),
+                "--load" => load = Some(value()?),
+                "--save" => save = Some(value()?),
                 _ => return Err(usage(format!("unknown option '{name}'"))),
             }
         }
@@ -187,6 +209,8 @@ impl Options {
             capacity,
             max_weight,
             ttl,
+            load,
+            save,
         };
         options
             .builder(PolicyKind::Lru, &ManualClock::new())
@@ -244,10 +268,7 @@ fn read_trace(path: &str, stdin: &mut dyn BufRead) -> Result<Vec<Op>, CliError> 
     let parsed = if path == "-" {
         trace::parse(stdin)
     } else {
-        let file = File::open(path).map_err(|source| CliError::Open {
-            path: path.to_string(),
-            source,
-        })?;
+        let file = File::open(path).map_err(|source| open_error(path, source))?;
         trace::parse(BufReader::new(file))
     };
     parsed.map_err(|source| CliError::Trace {
@@ -256,24 +277,51 @@ fn read_trace(path: &str, stdin: &mut dyn BufRead) -> Result<Vec<Op>, CliError> 
     })
 }
 
-/// Builds a cache for `policy` and replays `ops` against it.
+fn open_error(path: &str, source: io::Error) -> CliError {
+    CliError::Open {
+        path: path.to_string(),
+        source,
+    }
+}
+
+fn snapshot_error(path: &str, source: SnapshotError) -> CliError {
+    CliError::Snapshot {
+        path: path.to_string(),
+        source,
+    }
+}
+
+/// Builds a cache for `policy`, fills it from the `--load` snapshot if
+/// there is one, and replays `ops` against it. The statistics are reset
+/// after loading so that they describe the trace alone.
 fn simulate(
     options: &Options,
     policy: PolicyKind,
     ops: &[Op],
-) -> (DynCache<String, String>, ReplaySummary) {
+) -> Result<(DynCache<String, String>, ReplaySummary), CliError> {
     let clock = ManualClock::new();
     let mut cache = options
         .builder(policy, &clock)
         .build()
         .expect("options were validated when they were parsed");
+    if let Some(path) = &options.load {
+        let file = File::open(path).map_err(|source| open_error(path, source))?;
+        snapshot::load(&mut cache, BufReader::new(file))
+            .map_err(|source| snapshot_error(path, source))?;
+        cache.reset_stats();
+    }
     let summary = trace::replay(&mut cache, &clock, ops);
-    (cache, summary)
+    Ok((cache, summary))
 }
 
 fn replay_command(options: &Options, ops: &[Op], out: &mut dyn Write) -> Result<(), CliError> {
     let policy = options.policy.unwrap_or(PolicyKind::Lru);
-    let (cache, summary) = simulate(options, policy, ops);
+    let (cache, summary) = simulate(options, policy, ops)?;
+    if let Some(path) = &options.save {
+        let file = File::create(path).map_err(|source| open_error(path, source))?;
+        snapshot::save(&cache, io::BufWriter::new(file))
+            .map_err(|source| snapshot_error(path, source))?;
+    }
     let mut report = String::new();
     report.push_str(&format!("trace:       {}\n", options.trace));
     report.push_str(&format!("policy:      {policy}\n"));
@@ -304,7 +352,7 @@ fn compare_command(options: &Options, ops: &[Op], out: &mut dyn Write) -> Result
         "policy", "hits", "misses", "hit rate", "evictions", "expirations"
     ));
     for policy in PolicyKind::ALL {
-        let (cache, _) = simulate(options, policy, ops);
+        let (cache, _) = simulate(options, policy, ops)?;
         let stats = cache.stats();
         report.push_str(&format!(
             "{:<6} {:>10} {:>10} {:>8.2}% {:>10} {:>11}\n",
@@ -408,6 +456,28 @@ mod tests {
         assert_eq!(rows[2], ["lfu", "4", "0", "100.00%", "2", "0"]);
         assert_eq!(rows[3], ["fifo", "3", "1", "75.00%", "2", "0"]);
         assert_eq!(rows.len(), 4);
+    }
+
+    #[test]
+    fn snapshot_options_are_replay_only() {
+        for option in ["--load", "--save"] {
+            assert_eq!(
+                usage_error(&["compare", "-", "--capacity", "2", option, "cache.snap"]),
+                "--load and --save cannot be used with compare"
+            );
+            assert_eq!(
+                usage_error(&["replay", "-", "--capacity", "2", option]),
+                format!("{option} needs a value")
+            );
+        }
+    }
+
+    #[test]
+    fn missing_snapshot_is_an_open_error() {
+        let args = ["replay", "-", "--capacity", "2", "--load", "no/such/cache.snap"];
+        let error = run_with(&args, TRACE).unwrap_err();
+        assert!(matches!(&error, CliError::Open { path, .. } if path == "no/such/cache.snap"));
+        assert_eq!(error.exit_code(), 1);
     }
 
     #[test]
