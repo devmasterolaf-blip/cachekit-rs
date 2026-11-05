@@ -22,7 +22,8 @@ pub const USAGE: &str = "\
 cachekit - replay cache traces against an eviction policy
 
 Usage:
-  cachekit replay <trace> [options]
+  cachekit replay <trace> [options]    run one policy and print its statistics
+  cachekit compare <trace> [options]   run every policy and print a table
   cachekit help
   cachekit --version
 
@@ -30,7 +31,8 @@ Usage:
 clear); use - to read it from standard input.
 
 Options:
-  --policy <name>     eviction policy: lru, lfu or fifo (default: lru)
+  --policy <name>     eviction policy: lru, lfu or fifo (default: lru;
+                      replay only)
   --capacity <n>      keep at most <n> entries
   --max-weight <n>    keep at most <n> bytes of keys plus values
   --ttl-ms <n>        expire entries <n> simulated milliseconds after a write
@@ -114,6 +116,14 @@ pub fn run(args: &[String], stdin: &mut dyn BufRead, out: &mut dyn Write) -> Res
             let ops = read_trace(&options.trace, stdin)?;
             replay_command(&options, &ops, out)
         }
+        "compare" => {
+            let options = Options::parse(rest)?;
+            if options.policy.is_some() {
+                return Err(usage("--policy cannot be used with compare"));
+            }
+            let ops = read_trace(&options.trace, stdin)?;
+            compare_command(&options, &ops, out)
+        }
         other => Err(usage(format!("unknown command '{other}'"))),
     }
 }
@@ -122,7 +132,7 @@ pub fn run(args: &[String], stdin: &mut dyn BufRead, out: &mut dyn Write) -> Res
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Options {
     trace: String,
-    policy: PolicyKind,
+    policy: Option<PolicyKind>,
     capacity: Option<usize>,
     max_weight: Option<u64>,
     ttl: Option<Duration>,
@@ -131,7 +141,7 @@ struct Options {
 impl Options {
     fn parse(args: &[String]) -> Result<Self, CliError> {
         let mut trace = None;
-        let mut policy = PolicyKind::Lru;
+        let mut policy = None;
         let mut capacity = None;
         let mut max_weight = None;
         let mut ttl = None;
@@ -158,9 +168,10 @@ impl Options {
             };
             match name {
                 "--policy" => {
-                    policy = value()?
+                    let kind = value()?
                         .parse()
                         .map_err(|error| usage(format!("--policy: {error}")))?;
+                    policy = Some(kind);
                 }
                 "--capacity" => capacity = Some(number(name, &value()?)?),
                 "--max-weight" => max_weight = Some(number(name, &value()?)?),
@@ -178,7 +189,7 @@ impl Options {
             ttl,
         };
         options
-            .builder(policy, &ManualClock::new())
+            .builder(PolicyKind::Lru, &ManualClock::new())
             .validate()
             .map_err(|error| usage(describe(&error)))?;
         Ok(options)
@@ -261,10 +272,11 @@ fn simulate(
 }
 
 fn replay_command(options: &Options, ops: &[Op], out: &mut dyn Write) -> Result<(), CliError> {
-    let (cache, summary) = simulate(options, options.policy, ops);
+    let policy = options.policy.unwrap_or(PolicyKind::Lru);
+    let (cache, summary) = simulate(options, policy, ops);
     let mut report = String::new();
     report.push_str(&format!("trace:       {}\n", options.trace));
-    report.push_str(&format!("policy:      {}\n", options.policy));
+    report.push_str(&format!("policy:      {policy}\n"));
     report.push_str(&format!("capacity:    {}\n", options.limits()));
     if let Some(ttl) = options.ttl {
         report.push_str(&format!("ttl:         {} ms\n", ttl.as_millis()));
@@ -276,6 +288,34 @@ fn replay_command(options: &Options, ops: &[Op], out: &mut dyn Write) -> Result<
         report.push_str(&format!("bytes:       {}\n", cache.weight()));
     }
     report.push_str(&format!("{}\n", cache.stats()));
+    out.write_all(report.as_bytes()).map_err(CliError::Output)
+}
+
+fn compare_command(options: &Options, ops: &[Op], out: &mut dyn Write) -> Result<(), CliError> {
+    let mut report = String::new();
+    report.push_str(&format!("trace:       {}\n", options.trace));
+    report.push_str(&format!("capacity:    {}\n", options.limits()));
+    if let Some(ttl) = options.ttl {
+        report.push_str(&format!("ttl:         {} ms\n", ttl.as_millis()));
+    }
+    report.push_str(&format!("operations:  {}\n\n", ops.len()));
+    report.push_str(&format!(
+        "{:<6} {:>10} {:>10} {:>9} {:>10} {:>11}\n",
+        "policy", "hits", "misses", "hit rate", "evictions", "expirations"
+    ));
+    for policy in PolicyKind::ALL {
+        let (cache, _) = simulate(options, policy, ops);
+        let stats = cache.stats();
+        report.push_str(&format!(
+            "{:<6} {:>10} {:>10} {:>8.2}% {:>10} {:>11}\n",
+            policy.as_str(),
+            stats.hits,
+            stats.misses,
+            stats.hit_rate() * 100.0,
+            stats.evictions,
+            stats.expirations
+        ));
+    }
     out.write_all(report.as_bytes()).map_err(CliError::Output)
 }
 
@@ -344,6 +384,39 @@ mod tests {
         assert_eq!(field(&lru, "hits:"), "2");
         assert_eq!(field(&fifo, "policy:"), "fifo");
         assert_eq!(field(&fifo, "hits:"), "1");
+    }
+
+    #[test]
+    fn compare_prints_one_row_per_policy() {
+        // "a" is read twice early on, so LFU protects it; LRU and FIFO lose
+        // it to the later one-off keys.
+        let trace = "put a 1\nget a\nget a\nput b 2\nput c 3\nput d 4\nget a\nget d\n";
+        let report = run_with(&["compare", "-", "--capacity", "2"], trace).unwrap();
+        assert_eq!(field(&report, "capacity:"), "2 entries");
+        assert_eq!(field(&report, "operations:"), "8");
+
+        let rows: Vec<Vec<&str>> = report
+            .lines()
+            .skip_while(|line| !line.starts_with("policy"))
+            .map(|line| line.split_whitespace().collect())
+            .collect();
+        assert_eq!(
+            rows[0],
+            ["policy", "hits", "misses", "hit", "rate", "evictions", "expirations"]
+        );
+        assert_eq!(rows[1], ["lru", "3", "1", "75.00%", "2", "0"]);
+        assert_eq!(rows[2], ["lfu", "4", "0", "100.00%", "2", "0"]);
+        assert_eq!(rows[3], ["fifo", "3", "1", "75.00%", "2", "0"]);
+        assert_eq!(rows.len(), 4);
+    }
+
+    #[test]
+    fn compare_rejects_a_policy_option() {
+        assert_eq!(
+            usage_error(&["compare", "-", "--capacity", "2", "--policy", "lru"]),
+            "--policy cannot be used with compare"
+        );
+        assert_eq!(usage_error(&["compare", "-"]), "set --capacity or --max-weight");
     }
 
     #[test]
