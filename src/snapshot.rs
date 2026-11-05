@@ -10,7 +10,7 @@
 //!
 //! The first line is a fixed header. Every following non-empty line is one
 //! entry with three tab-separated fields. Keys and values are written with
-//! their [`Display`](std::fmt::Display) form and read back with
+//! their [`Display`] form and read back with
 //! [`FromStr`]; backslash, tab, newline and carriage return inside them are
 //! escaped as `\\`, `\t`, `\n` and `\r`. Entries appear in eviction order,
 //! coldest first, so loading them in file order into an empty LRU or FIFO
